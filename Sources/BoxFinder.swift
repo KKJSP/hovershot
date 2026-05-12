@@ -229,13 +229,16 @@ struct BoxFinder {
 
     // MARK: - Network construction
 
-    /// Two main passes plus two post-processing passes:
+    /// One main pass plus several post-processing passes, run in order:
     ///   * Per-sea pairwise `connectionProbability`, threshold 0.5.
-    ///   * Bridge pass: within each sea, union the connected components and add an
-    ///     edge between any two close-but-disconnected components — fixes the case
-    ///     where a tiny "bridge" box's poor area-ratio kept it from joining its
-    ///     neighbours and split a cluster in two.
-    ///   * Aligned-series pass for stacked rows / inline text segments.
+    ///   * `pruneOutlierConnections` first — clean up the per-pair pass before
+    ///     the additive series/caption passes use it as their starting point;
+    ///     an outlier edge would otherwise drag in its neighbour-set during
+    ///     those passes and survive intact.
+    ///   * `connectAlignedSeries` for stacked rows / inline text segments.
+    ///   * `connectCaptions` for short labels above/below substantial anchors.
+    ///   * `pruneCrossingConnections` last — drop any edge whose shortest
+    ///     connecting segment cuts through an unrelated box.
     ///
     /// Engulfment is never connected. The Python `_connect_noisy_boxes` step that
     /// linked nested children to their containing parent is intentionally absent
@@ -270,9 +273,10 @@ struct BoxFinder {
             }
         }
 
+        pruneOutlierConnections(network: &network)
         connectAlignedSeries(seas: seas, network: &network, mergeDistance: mergeDistance)
         connectCaptions(seas: seas, network: &network, mergeDistance: mergeDistance)
-        pruneOutlierConnections(network: &network)
+        pruneCrossingConnections(boxes: boxes, network: &network)
         return network
     }
 
@@ -320,6 +324,141 @@ struct BoxFinder {
             network[a]?.removeAll { $0 == b }
             network[b]?.removeAll { $0 == a }
         }
+    }
+
+    /// Drop edges whose shortest connecting segment passes through the
+    /// interior of a third box that isn't a neighbour of either endpoint.
+    /// The motivating case is a cross-sea or wide-gap link where two boxes
+    /// got connected "over" an unrelated element sitting between them — once
+    /// `expandCluster` walks the edge, the unrelated box's own neighbourhood
+    /// can be pulled in via its other links.
+    ///
+    /// "Shortest segment" is edge-to-edge, not centre-to-centre: when the
+    /// boxes share a row, the segment is horizontal at the midpoint of their
+    /// y-projection overlap; when they share a column, vertical at the
+    /// x-projection midpoint; otherwise corner-to-corner. The line therefore
+    /// runs through the empty gap between the boxes, which is where a
+    /// blocker would actually sit.
+    ///
+    /// A blocker is any box C (≠ A, B) that:
+    ///   * is not in `network[A]` or `network[B]` (either direction —
+    ///     `linkBoxes` may create one-way edges for size-asymmetric pairs,
+    ///     and we want a directed A→B to still count B as A's neighbour for
+    ///     this purpose);
+    ///   * does not envelop the segment (both endpoints inside C). A
+    ///     containing element — page panel, card, notebook cell — is
+    ///     non-adjacent to its children (engulfment edges are forbidden by
+    ///     `connectionProbability`), so without this gate every adjacent
+    ///     word in a paragraph that sits inside a container would have its
+    ///     edge pruned because the short word-to-word segment lies inside
+    ///     the container's interior. Skip C if it wraps the segment; only
+    ///     boxes that separate the endpoints (segment exits C between them)
+    ///     count as blockers; and
+    ///   * the segment's interior crosses (Liang–Barsky clip with strict
+    ///     `tmin < tmax`, so tangents / corner touches don't trigger).
+    ///
+    /// Overlapping pairs are skipped: there is no separating gap to inspect.
+    /// Touching pairs (edge distance = 0, no overlap on either axis) yield a
+    /// zero-length segment and are also skipped.
+    ///
+    /// Removal is symmetric, mirroring the other prune passes.
+    private func pruneCrossingConnections(boxes: [Box], network: inout [Box: [Box]]) {
+        // Undirected neighbour membership: a directed A→B still counts B as
+        // A's neighbour (and vice versa) for the blocker test.
+        var neighbourSet: [Box: Set<Box>] = [:]
+        for (origin, targets) in network {
+            for target in targets {
+                neighbourSet[origin, default: []].insert(target)
+                neighbourSet[target, default: []].insert(origin)
+            }
+        }
+
+        var toPrune: [(Box, Box)] = []
+        for (a, neighbours) in network {
+            for b in neighbours {
+                guard let segment = shortestSegment(a, b) else { continue }
+                for c in boxes where c != a && c != b {
+                    if neighbourSet[a]?.contains(c) == true { continue }
+                    if neighbourSet[b]?.contains(c) == true { continue }
+                    if pointInside(segment.0, box: c)
+                        && pointInside(segment.1, box: c) { continue }
+                    if segmentIntersectsBox(p1: segment.0, p2: segment.1, box: c) {
+                        toPrune.append((a, b))
+                        break
+                    }
+                }
+            }
+        }
+
+        for (a, b) in toPrune {
+            network[a]?.removeAll { $0 == b }
+            network[b]?.removeAll { $0 == a }
+        }
+    }
+
+    /// Endpoints of the shortest segment between two axis-aligned boxes:
+    /// midpoint of the projection overlap on whichever axis they overlap,
+    /// nearest edge coordinate on the axis they don't. Returns nil for
+    /// overlapping or touching pairs where the segment degenerates to a
+    /// point.
+    private func shortestSegment(_ a: Box, _ b: Box) -> ((Double, Double), (Double, Double))? {
+        let xa: Double, xb: Double
+        if a.right <= b.left {
+            xa = Double(a.right); xb = Double(b.left)
+        } else if b.right <= a.left {
+            xa = Double(a.left);  xb = Double(b.right)
+        } else {
+            let mid = Double(max(a.left, b.left) + min(a.right, b.right)) / 2.0
+            xa = mid; xb = mid
+        }
+        let ya: Double, yb: Double
+        if a.bottom <= b.top {
+            ya = Double(a.bottom); yb = Double(b.top)
+        } else if b.bottom <= a.top {
+            ya = Double(a.top);    yb = Double(b.bottom)
+        } else {
+            let mid = Double(max(a.top, b.top) + min(a.bottom, b.bottom)) / 2.0
+            ya = mid; yb = mid
+        }
+        if xa == xb && ya == yb { return nil }
+        return ((xa, ya), (xb, yb))
+    }
+
+    /// Inclusive point-in-box test (boundary counts as inside). Used to
+    /// detect when a candidate blocker actually wraps the segment rather
+    /// than cutting across it.
+    private func pointInside(_ p: (Double, Double), box: Box) -> Bool {
+        return p.0 >= Double(box.left) && p.0 <= Double(box.right)
+            && p.1 >= Double(box.top)  && p.1 <= Double(box.bottom)
+    }
+
+    /// Liang–Barsky clip: does the open segment (p1, p2) cross the interior
+    /// of `box`? Strict `tmin < tmax` so touches / tangents return false.
+    private func segmentIntersectsBox(p1: (Double, Double), p2: (Double, Double),
+                                      box: Box) -> Bool {
+        let xmin = Double(box.left), xmax = Double(box.right)
+        let ymin = Double(box.top),  ymax = Double(box.bottom)
+        let dx = p2.0 - p1.0, dy = p2.1 - p1.1
+        let ps: [Double] = [-dx,  dx, -dy,  dy]
+        let qs: [Double] = [p1.0 - xmin, xmax - p1.0, p1.1 - ymin, ymax - p1.1]
+
+        var tmin: Double = 0, tmax: Double = 1
+        for i in 0..<4 {
+            let p = ps[i], q = qs[i]
+            if p == 0 {
+                if q < 0 { return false }
+            } else {
+                let t = q / p
+                if p < 0 {
+                    if t > tmax { return false }
+                    if t > tmin { tmin = t }
+                } else {
+                    if t < tmin { return false }
+                    if t < tmax { tmax = t }
+                }
+            }
+        }
+        return tmin < tmax
     }
 
     /// Link a much-smaller box (label, title, caption) to a substantial anchor
