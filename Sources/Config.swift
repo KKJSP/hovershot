@@ -85,12 +85,6 @@ enum Config {
         NotificationCenter.default.post(name: .shortcutsDidChange, object: action)
     }
 
-    static func subFolder(_ name: String) -> URL {
-        let url = saveFolder.appendingPathComponent(name, isDirectory: true)
-        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        return url
-    }
-
     enum Palette {
         static let primary    = NSColor(srgbRed: 252/255, green: 129/255, blue:   2/255, alpha: 1)
         static let secondary  = NSColor(srgbRed:  78/255, green: 145/255, blue: 166/255, alpha: 1)

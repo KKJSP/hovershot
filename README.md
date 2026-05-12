@@ -36,7 +36,7 @@ single key.
 | Save folder           | Where saved PNGs land (default `~/Desktop`)                                   |
 | Box size (0–100%)     | Morphology kernel size — lower = smaller individual boxes, higher = boxes merge into adjacent elements |
 | Selection padding (px)| Pixels added around the selection rect when saving / copying                  |
-| Debug mode            | Writes the pipeline's intermediate images into `ScreenshotsDebug/` per shot   |
+| Debug mode            | Writes pipeline images (`0_source`, `1_edges`, `2_seas`, `3_connections`) into the save folder per shot |
 
 Settings persist under `~/Library/Preferences/com.hovershot.app.HoverShot.plist`
 behind the `hovershot.` key prefix.

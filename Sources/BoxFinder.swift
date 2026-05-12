@@ -2,29 +2,6 @@ import AppKit
 import CoreGraphics
 import Foundation
 
-struct UnionFind {
-    private var parent: [Int]
-
-    init(count: Int) { parent = Array(0..<count) }
-
-    mutating func find(_ x: Int) -> Int {
-        var x = x
-        while parent[x] != x {
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        }
-        return x
-    }
-
-    @discardableResult
-    mutating func union(_ a: Int, _ b: Int) -> Bool {
-        let ra = find(a), rb = find(b)
-        if ra == rb { return false }
-        if ra < rb { parent[rb] = ra } else { parent[ra] = rb }
-        return true
-    }
-}
-
 struct DetectionResult {
     let boxes: [Box]
     let network: [Box: [Box]]
@@ -140,11 +117,10 @@ struct BoxFinder {
             DebugImageWriter.writeIfEnabled(
                 source: cgImage,
                 edges: edges,
-                closed: closed,
                 width: lab.width,
                 height: lab.height,
-                initialBoxes: allBoxes,
-                seas: seas
+                seas: seas,
+                network: network
             )
         }
 
@@ -279,7 +255,13 @@ struct BoxFinder {
             for box in sea.members {
                 if network[box] != nil { continue }
                 var connections: [Box] = []
+                let boxArea = Double(box.area)
                 for other in sea.members where other != box {
+                    // Asymmetry: a much-smaller box never gains a forward edge
+                    // to a much-larger one. The connection probability formula
+                    // already disfavours this direction, but enforce it
+                    // explicitly so the rule is uniform across all passes.
+                    if boxArea * asymRatio < Double(other.area) { continue }
                     if box.connectionProbability(other, mergeDistance: mergeDistance) > 0.5 {
                         connections.append(other)
                     }
@@ -288,9 +270,123 @@ struct BoxFinder {
             }
         }
 
-        bridgeNearbyComponents(seas: seas, network: &network, mergeDistance: mergeDistance)
         connectAlignedSeries(seas: seas, network: &network, mergeDistance: mergeDistance)
+        connectCaptions(seas: seas, network: &network, mergeDistance: mergeDistance)
+        pruneOutlierConnections(network: &network)
         return network
+    }
+
+    /// After every connection pass has run, look at each box's neighbour set
+    /// as a "neighbourhood scale": if one neighbour's area is wildly out of
+    /// distribution vs the others, that's a sign the rule that connected
+    /// them did so for the wrong reason. The motivating case is a figure
+    /// (heatmap) whose legitimate neighbours are tick labels, title words,
+    /// and colourbar parts — all small or medium — that has *also* been
+    /// linked to a peer code cell whose area is an order of magnitude bigger
+    /// than the median neighbour. We treat that edge as a likely false
+    /// positive and remove it from both ends.
+    ///
+    /// Algorithm:
+    ///   * Skip boxes with fewer than 4 neighbours — too noisy to call an
+    ///     outlier on so little data.
+    ///   * Compute the median neighbour area as the scale estimate.
+    ///   * Any neighbour whose area exceeds `outlierFactor × median` is
+    ///     marked for pruning.
+    ///   * Apply removals symmetrically so BFS from either end agrees.
+    ///
+    /// The 8× factor is intentionally conservative: a typical column or row
+    /// of mixed-size labels (axis ticks + a wider title + a colourbar
+    /// gradient strip) stays within that envelope; only the truly peer-sized
+    /// outliers (whole notebook cells, neighbouring figures) trip it.
+    private func pruneOutlierConnections(network: inout [Box: [Box]]) {
+        let outlierFactor: Double = 8.0
+        let minNeighbours = 4
+
+        var toPrune: [(Box, Box)] = []
+        for (box, neighbours) in network where neighbours.count >= minNeighbours {
+            let areas = neighbours.map { Double($0.area) }.sorted()
+            let n = areas.count
+            let median: Double = n % 2 == 0
+                ? (areas[n / 2 - 1] + areas[n / 2]) / 2.0
+                : areas[n / 2]
+            guard median > 0 else { continue }
+            let threshold = outlierFactor * median
+            for neighbour in neighbours where Double(neighbour.area) > threshold {
+                toPrune.append((box, neighbour))
+            }
+        }
+
+        for (a, b) in toPrune {
+            network[a]?.removeAll { $0 == b }
+            network[b]?.removeAll { $0 == a }
+        }
+    }
+
+    /// Link a much-smaller box (label, title, caption) to a substantial anchor
+    /// directly above or below it. The other passes deliberately reject pairs
+    /// whose heights differ wildly — without that gate, aligned-series glues
+    /// unrelated cells together — but legitimate captions are exactly that
+    /// shape: a 20px text label above a 600px figure, or a 30px legend right
+    /// under a 400px panel. This pass restores those links under these gates:
+    ///   * `small.height ≤ 0.4 × big.height` (caption ratio)
+    ///   * `big` is itself substantial (min dim ≥ `largeBoxThreshold`)
+    ///   * `small` sits strictly above or below `big`
+    ///   * If `small` is wider than `big`, it must also be proportionally very
+    ///     thin (≤ 5% of `big.height`) and no wider than 1.5× — wide-and-short
+    ///     reads as a long descriptive title; wide-and-medium-height reads as
+    ///     a peer code cell.
+    ///   * x-overlap covers ≥ 40% of `small.width` — tolerates slight
+    ///     misalignment without letting an unrelated paragraph word qualify
+    ///   * vertical gap ≤ 3 × `small.height`, both directions. The same
+    ///     budget works for chart titles directly above a figure and for
+    ///     x-axis titles that sit beneath a row of tick labels.
+    /// Same-sea only; cross-sea captions are too risky without colour evidence.
+    private func connectCaptions(seas: [Sea], network: inout [Box: [Box]],
+                                 mergeDistance: Double) {
+        let largeThreshold = largeBoxThreshold(mergeDistance)
+        for sea in seas where sea.members.count > 1 {
+            let members = sea.members
+            for i in 0..<members.count {
+                for j in (i + 1)..<members.count {
+                    let a = members[i], b = members[j]
+                    let small: Box, big: Box
+                    if a.height < b.height { small = a; big = b }
+                    else                   { small = b; big = a }
+
+                    if Double(small.height) > Double(big.height) * 0.4 { continue }
+                    if Double(min(big.width, big.height)) < largeThreshold { continue }
+                    // A caption *can* be slightly wider than the anchor (long
+                    // descriptive titles, axis labels that extend past the
+                    // plot's box), but only if it's proportionally very thin —
+                    // wide-and-short reads as a title; wide-and-medium-height
+                    // is a peer code cell.
+                    if small.width > big.width {
+                        if small.width > big.width * 3 / 2 { continue }
+                        if Double(small.height) > Double(big.height) * 0.05 { continue }
+                    }
+
+                    let above = small.bottom <= big.top
+                    let below = small.top    >= big.bottom
+                    guard above || below else { continue }
+
+                    let xOverlap = min(small.right, big.right) - max(small.left, big.left)
+                    if xOverlap <= 0 { continue }
+                    // 40% lets a title sit slightly off-centre without losing
+                    // the link; tight enough that an unrelated paragraph word
+                    // that happens to project under the figure still misses.
+                    if Double(xOverlap) < Double(small.width) * 0.4 { continue }
+
+                    let gap = above ? (big.top - small.bottom) : (small.top - big.bottom)
+                    // Equal budget above and below — x-axis titles sit beneath
+                    // tick labels and need the same room as a chart title
+                    // sitting above its plot.
+                    let budget = Double(small.height) * 3.0
+                    if Double(gap) > budget { continue }
+
+                    linkBoxes(small, big, network: &network)
+                }
+            }
+        }
     }
 
     /// Threshold above which a box's shorter dimension marks it as "large".
@@ -301,6 +397,38 @@ struct BoxFinder {
     /// embedded image).
     private func largeBoxThreshold(_ mergeDistance: Double) -> Double {
         mergeDistance * 8
+    }
+
+    /// Area ratio above which two boxes are considered "very different sized".
+    /// When `big.area > asymRatio × small.area`, the link between them is added
+    /// only in the `big → small` direction — hovering a tick label shouldn't
+    /// drag in the heatmap above it, but hovering the heatmap should still
+    /// pull in its labels. The threshold is deliberately generous (20×) so
+    /// peer words on the same line stay bidirectional even when their widths
+    /// differ a lot — "of" vs "Comparison" sits at roughly 12× and must
+    /// remain a peer relation, while heatmap-vs-tick (≈350×) is clearly a
+    /// container/label split.
+    private let asymRatio: Double = 20.0
+
+    /// Add an undirected geometric relation as one or two directed edges,
+    /// depending on the size disparity between the boxes:
+    ///   * Similar sizes (within `asymRatio`× area): both directions added.
+    ///   * One box much larger: only the `large → small` direction is added.
+    /// `expandCluster` walks forward edges only, so omitting the
+    /// `small → large` edge prevents hovering a small thing from pulling its
+    /// anchor into the selection while still letting the anchor reach down
+    /// into its own labels/captions.
+    private func linkBoxes(_ a: Box, _ b: Box, network: inout [Box: [Box]]) {
+        let aArea = Double(a.area)
+        let bArea = Double(b.area)
+        let aMuchSmaller = aArea * asymRatio < bArea
+        let bMuchSmaller = bArea * asymRatio < aArea
+        if !aMuchSmaller, !(network[a]?.contains(b) ?? false) {
+            network[a, default: []].append(b)
+        }
+        if !bMuchSmaller, !(network[b]?.contains(a) ?? false) {
+            network[b, default: []].append(a)
+        }
     }
 
     /// Final pass: connect boxes that read as part of a series — text on the
@@ -352,65 +480,25 @@ struct BoxFinder {
 
                     // Vertical stack — code lines, list rows, paragraph blocks.
                     // x-projections overlap, heights similar, y-gap ≤ avg height.
+                    // Width ratio also has to be reasonable: a 15px-wide tick
+                    // label sitting under a 900px code cell shares a column on
+                    // a `min(widths)` basis but absolutely isn't part of the
+                    // same row, and without this gate the tick→cell-below link
+                    // transitively pulls in the wrong cell when the user picks
+                    // a figure above the tick.
                     if !connect && xOverlap > 0 && yOverlap <= 0 {
                         let xFrac = Double(xOverlap) / Double(min(a.width, b.width))
+                        let widthRatio = Double(min(a.width, b.width)) / Double(max(a.width, b.width))
                         let yGap  = Double(-yOverlap)
                         if xFrac >= projectionMin && hRatio >= heightRatioMin
+                            && widthRatio >= 0.3
                             && yGap <= avgH * gapFactor {
                             connect = true
                         }
                     }
 
                     guard connect else { continue }
-                    if !(network[a]?.contains(b) ?? false) {
-                        network[a, default: []].append(b)
-                    }
-                    if !(network[b]?.contains(a) ?? false) {
-                        network[b, default: []].append(a)
-                    }
-                }
-            }
-        }
-    }
-
-    private func bridgeNearbyComponents(seas: [Sea], network: inout [Box: [Box]],
-                                        mergeDistance: Double) {
-        let bridgeDistance = mergeDistance
-        let largeThreshold = largeBoxThreshold(mergeDistance)
-        for sea in seas where sea.members.count > 1 {
-            let members = sea.members
-            var memberIdx: [Box: Int] = [:]
-            memberIdx.reserveCapacity(members.count)
-            for (i, m) in members.enumerated() { memberIdx[m] = i }
-
-            var uf = UnionFind(count: members.count)
-            for (box, neighbours) in network {
-                guard let i = memberIdx[box] else { continue }
-                for n in neighbours {
-                    if let j = memberIdx[n] { uf.union(i, j) }
-                }
-            }
-
-            for i in 0..<members.count {
-                for j in (i + 1)..<members.count {
-                    if uf.find(i) == uf.find(j) { continue }
-                    let a = members[i], b = members[j]
-                    // Never bridge engulfing pairs — full containment is reserved
-                    // for the (now-removed) noise-parent pass and would otherwise
-                    // make a tiny child drag in its enclosing container.
-                    if a.contains(b) || b.contains(a) { continue }
-                    // Don't bridge two large boxes either: bridging exists to
-                    // re-link clusters that a small intermediary box's poor
-                    // area-ratio kept apart, not to glue together independent
-                    // big regions like notebook cells.
-                    let aLarge = Double(min(a.width, a.height)) > largeThreshold
-                    let bLarge = Double(min(b.width, b.height)) > largeThreshold
-                    if aLarge && bLarge { continue }
-                    if a.edgeDistance(b) < bridgeDistance {
-                        uf.union(i, j)
-                        network[a, default: []].append(b)
-                        network[b, default: []].append(a)
-                    }
+                    linkBoxes(a, b, network: &network)
                 }
             }
         }
