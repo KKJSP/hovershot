@@ -8,6 +8,16 @@ struct DetectionResult {
     /// The seas that survived clustering — keyed by representative LAB colour, each
     /// holding the boxes belonging to that sea. Useful for debugging / visualisation.
     let seas: [(L: Int, a: Int, b: Int, members: [Box])]
+    /// Per-box OCR classification. Boxes matched to a Vision word carry
+    /// `.word(text, confidence, lineID)`; everything else is `.nonText`. The
+    /// network and clustering passes don't consume this yet — it's plumbed
+    /// through so debug output and the upcoming caption / paragraph /
+    /// heading-vs-body passes can see it without re-running OCR.
+    let tags: [Box: BoxKind]
+    /// Raw Vision output, kept around so debug visualisation and later
+    /// paragraph-inference passes can use line groupings directly rather
+    /// than reverse-engineering them from tagged boxes.
+    let words: [RecognizedWord]
 }
 
 /// Faithful port of `boxfinder.py`'s `BoxFinder.predict` pipeline:
@@ -53,8 +63,23 @@ struct BoxFinder {
         let kx = ksize.w
         let ky = ksize.h
 
+        // Kick OCR off on a parallel worker while the LAB / Canny / morphology
+        // / CC pipeline runs on this thread. Vision's `.fast` text recogniser
+        // is independent of all the colour-domain work below, so the two
+        // pipelines overlap cleanly and we pay roughly `max(ocr, cc)` instead
+        // of their sum. Joined just before tagging.
+        let ocrGroup = DispatchGroup()
+        var recognizedWords: [RecognizedWord] = []
+        ocrGroup.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            recognizedWords = TextRecognition.recognizeWords(in: cgImage)
+            ocrGroup.leave()
+        }
+
         guard let lab = LABConverter.convert(cgImage) else {
-            return DetectionResult(boxes: [], network: [:], seas: [])
+            ocrGroup.wait()
+            return DetectionResult(boxes: [], network: [:], seas: [],
+                                   tags: [:], words: recognizedWords)
         }
 
         // 1. Edge detection on the L channel + morphological closing.
@@ -65,66 +90,155 @@ struct BoxFinder {
                                       kw: kx, kh: ky)
 
         // 2. Connected-components labelling stands in for `findContours(RETR_TREE)`.
-        let (allBoxes, parentIndex) = ConnectedComponents.label(closed,
-                                                                 width: lab.width,
-                                                                 height: lab.height)
+        //    The legacy `parentIndex` is intentionally unused now — the
+        //    nested-children rule that consumed it was a font-size-blind
+        //    proxy for "drop interior pieces of text", which the OCR-driven
+        //    sub-letter pass below handles directly.
+        let (allBoxes, _) = ConnectedComponents.label(closed,
+                                                       width: lab.width,
+                                                       height: lab.height)
 
         let initialCount = allBoxes.count
 
-        // 3. Selectable-box filter — port of `_selectable_boxes`.
+        // 3. Selectable-box filter — size and image-area bounds only.
+        //    The old `maxChildArea` + parent-shape gate is removed (phase 4):
+        //    nested-children was the legacy stand-in for "interior of a
+        //    word/letter", and we now reject those text-internal CC blobs
+        //    directly via `dropSubLetterBoxes` once OCR has reported the
+        //    word boundaries.
         let imageArea = lab.width * lab.height
         let maxArea = Double(imageArea) * 0.6
-        let maxChildArea = Double(kx * ky) * 250.0
 
         var selectableSet = Set<Box>()
-        for (i, box) in allBoxes.enumerated() {
+        for box in allBoxes {
             if box.width  < kx || box.height < ky { continue }
             if Double(box.area) > maxArea          { continue }
-            if Double(box.area) < maxChildArea, parentIndex[i] != -1 {
-                let parent = allBoxes[parentIndex[i]]
-                if parent.width  - box.width  < 4 * kx ||
-                   parent.height - box.height < 6 * ky {
-                    continue
-                }
-            }
             selectableSet.insert(box)
         }
         var selectable = Array(selectableSet)
 
-        // 4. Perimeter sampling → stable boxes + per-box sea colour.
+        // 4. Join the OCR worker. We need word boundaries before the
+        //    sub-letter / over-merge pass and the perimeter sampling that
+        //    follows — selectable filter above is cheap, so by the time we
+        //    arrive here the OCR worker has typically already finished and
+        //    `wait()` is close to a no-op.
+        ocrGroup.wait()
+
+        // 5. OCR-driven cleanups, in order:
+        //
+        //    a. `applyVisionBoxes` — in regions Vision identifies as text,
+        //       prefer Vision's word-level boxes over CC's coarser
+        //       morphology-derived ones. The morphology kernel is a single
+        //       size for the whole image and chronically glues multiple
+        //       words at small font sizes; Vision is font-size-blind and
+        //       puts boundaries in the right places. CC boxes whose
+        //       interior is densely covered by recognised words get
+        //       dropped; every Vision word is added as a selectable. This
+        //       also fixes the long-standing "Vision sees a word but the
+        //       pipeline never exposes it as a box" gap — missed CC
+        //       regions are recovered by the unconditional word add.
+        //    b. `dropSubLetterBoxes` — remove residual letter-internal CC
+        //       blobs (the dot of "i", the counter of "o", a stem fragment)
+        //       that sit fully inside a Vision word and are much smaller
+        //       than it. These survived step (a) because their parent CC
+        //       was either a non-text container kept around, or because
+        //       Vision didn't quite cover the surrounding region.
+        selectable = applyVisionBoxes(selectable, words: recognizedWords)
+        selectable = dropSubLetterBoxes(selectable, words: recognizedWords)
+
+        // 6. Sea-colour sampling → stable boxes + per-box sea colour. Two
+        //    strategies, depending on the box's origin:
+        //
+        //    * Vision-derived word boxes (`visionDerived`): sample the
+        //      *interior* of an expanded box and pick the dominant colour
+        //      (mode of an LAB histogram). Perimeter sampling fails for
+        //      words in two ways — left/right margins hit adjacent words,
+        //      and below-margin hits underlines / descenders when the
+        //      Vision box excludes them. Sampling the interior of a box
+        //      grown by half its dimensions on each side lets the
+        //      surrounding background dominate the histogram (the glyph
+        //      occupies only ~10–15 % of the expanded area), so two words
+        //      on the same background reliably land in the same sea
+        //      regardless of glyph density, underlines, or descenders.
+        //      The calmness gate doesn't apply — Vision already told us
+        //      the region is real text.
+        //
+        //    * Non-text CC boxes (everything else): perimeter sampling +
+        //      calmness gate, unchanged. We're grouping by *surrounding
+        //      context* there (a button's sea is the page background it
+        //      sits on), which is exactly what the perimeter samples.
+        let visionDerived: Set<Box> = Set(recognizedWords.map { $0.box })
         var stableBoxes: [Box] = []
-        var seaColours: [(Int, Int, Int)] = []
+        var seaColours: [((Int, Int, Int), (Int, Int, Int))] = []
         for box in selectable {
-            if let (colour, calm) = seaColourAndValidity(lab: lab, box: box), calm {
+            if visionDerived.contains(box) {
+                guard let pair = interiorColourPair(lab: lab, box: box) else { continue }
                 stableBoxes.append(box)
-                seaColours.append(colour)
+                seaColours.append(pair)
+            } else {
+                guard let (colour, calm) = seaColourAndValidity(lab: lab, box: box),
+                      calm else { continue }
+                stableBoxes.append(box)
+                seaColours.append((colour, colour))   // degenerate single-colour pair
             }
         }
         selectable = stableBoxes
 
-        // 5. Group boxes into seas by LAB-colour proximity.
+        // 7. Group boxes into seas by LAB-colour proximity.
         let seas = groupIntoSeas(boxes: selectable, colours: seaColours)
 
-        // 6. Build the adjacency network.
-        let network = buildNetwork(boxes: selectable, seas: seas)
+        // 8. Vision-line paragraph index + sizes. Computed here (rather than
+        //    inside `buildNetwork`) so the debug visualisation can show the
+        //    same classification the network construction uses.
+        let lineToParagraph = paragraphIndex(for: recognizedWords)
+        let paragraphSize = paragraphSizes(words: recognizedWords,
+                                           lineToParagraph: lineToParagraph)
 
-        let seasOut = seas.map { (L: $0.colour.0, a: $0.colour.1, b: $0.colour.2,
+        // Median Vision-word area. Used by `pruneLargeBoxConnections` to
+        // define "large" (= ≥ 20 × median word area). Median rather than
+        // mean so a stray banner-text Vision detection doesn't inflate
+        // the baseline. Fallback 400 (~ 20×20 word) if Vision produced
+        // nothing recognisable.
+        let medianWordArea: Double = {
+            let areas = recognizedWords.map { Double($0.box.area) }.sorted()
+            guard !areas.isEmpty else { return 400.0 }
+            return areas[areas.count / 2]
+        }()
+
+        // 9. Tag boxes and build the adjacency network.
+        let tags = TextRecognition.tagBoxes(selectable, using: recognizedWords)
+        let network = buildNetwork(boxes: selectable, seas: seas, tags: tags,
+                                   lineToParagraph: lineToParagraph,
+                                   paragraphSize: paragraphSize,
+                                   medianWordArea: medianWordArea)
+
+        let seasOut = seas.map { (L: $0.primaryColour.0,
+                                  a: $0.primaryColour.1,
+                                  b: $0.primaryColour.2,
                                   members: $0.members) }
 
         if Config.debug {
-            NSLog("[HoverShot] grouped %d boxes into %d boxes across %d seas (initial %d)",
-                  initialCount, selectable.count, seas.count, initialCount)
+            let wordCount = tags.values.reduce(0) { acc, t in
+                if case .word = t { return acc + 1 } else { return acc }
+            }
+            NSLog("[HoverShot] grouped %d boxes into %d boxes across %d seas (initial %d); OCR matched %d/%d",
+                  initialCount, selectable.count, seas.count, initialCount,
+                  wordCount, recognizedWords.count)
             DebugImageWriter.writeIfEnabled(
                 source: cgImage,
                 edges: edges,
                 width: lab.width,
                 height: lab.height,
                 seas: seas,
-                network: network
+                network: network,
+                words: recognizedWords,
+                lineToParagraph: lineToParagraph,
+                paragraphSize: paragraphSize
             )
         }
 
-        return DetectionResult(boxes: selectable, network: network, seas: seasOut)
+        return DetectionResult(boxes: selectable, network: network, seas: seasOut,
+                               tags: tags, words: recognizedWords)
     }
 
     // MARK: - Stage helpers
@@ -200,29 +314,177 @@ struct BoxFinder {
         return (meanColour, calm)
     }
 
+    /// Pair of dominant LAB colours inside a Vision word box, found by
+    /// streaming-cluster sampling: each sample joins an existing cluster
+    /// whose centre is within ~6 LAB units, or starts a new one. The most
+    /// populated cluster's centre is the **primary** colour, and the next
+    /// cluster whose centre is *contrastingly far* (LAB distance > 30) is
+    /// the **secondary**. Returns `(primary, primary)` if the box is
+    /// effectively single-colour (no contrasting second cluster found).
+    ///
+    /// Clustering instead of fixed-bin histograms because the sea-grouping
+    /// threshold (3 LAB units) is finer than any practical bin size; with
+    /// bins, two near-identical samples can straddle a bin boundary and
+    /// produce two centres that the sea grouper treats as different.
+    /// Clustering's running-mean centre tracks the true colour to within
+    /// the merge threshold, so an underlined word and a non-underlined one
+    /// on the same background land on the same primary regardless of the
+    /// small underline contribution.
+    ///
+    /// The "two most prominent contrasting colours" formulation comes from
+    /// the observation that for tight Vision word boxes the densest
+    /// cluster is often *text* (black, say) rather than background, since
+    /// glyphs can occupy a majority of a tight box at body sizes. We
+    /// return both colours and let `seaPairsMatch` decide pairwise — that
+    /// way swapping which one is text vs. background between two
+    /// otherwise-identical words doesn't fragment the sea.
+    private func interiorColourPair(lab: LABImage, box: Box) -> ((Int, Int, Int), (Int, Int, Int))? {
+        let totalPixels = box.width * box.height
+        guard totalPixels > 0 else { return nil }
+
+        let targetSamples: Double = 400
+        let stride = max(1, Int((Double(totalPixels) / targetSamples).squareRoot()))
+
+        // Cluster merge threshold (squared). 6 LAB units covers anti-alias
+        // halos and minor jpeg-style noise without lumping distinct
+        // colours together.
+        let mergeThresholdSq: Int = 6 * 6
+        struct Cluster {
+            var sumL: Int, sumA: Int, sumB: Int, count: Int
+            var center: (Int, Int, Int)
+        }
+        var clusters: [Cluster] = []
+
+        var y = box.y
+        while y < box.y + box.height {
+            var x = box.x
+            while x < box.x + box.width {
+                if let s = lab.sample(x: x, y: y) {
+                    var matched = false
+                    for i in 0..<clusters.count {
+                        let c = clusters[i].center
+                        let dl = c.0 - s.0, da = c.1 - s.1, db = c.2 - s.2
+                        if dl * dl + da * da + db * db < mergeThresholdSq {
+                            clusters[i].sumL += s.0
+                            clusters[i].sumA += s.1
+                            clusters[i].sumB += s.2
+                            clusters[i].count += 1
+                            let n = clusters[i].count
+                            clusters[i].center = (
+                                clusters[i].sumL / n,
+                                clusters[i].sumA / n,
+                                clusters[i].sumB / n
+                            )
+                            matched = true
+                            break
+                        }
+                    }
+                    if !matched {
+                        clusters.append(Cluster(
+                            sumL: s.0, sumA: s.1, sumB: s.2, count: 1, center: s
+                        ))
+                    }
+                }
+                x += stride
+            }
+            y += stride
+        }
+
+        let sorted = clusters.sorted { $0.count > $1.count }
+        guard let primary = sorted.first else { return nil }
+        let primaryColour = primary.center
+
+        let contrastThresholdSq = 30 * 30
+        for c in sorted.dropFirst() {
+            let dl = c.center.0 - primaryColour.0
+            let da = c.center.1 - primaryColour.1
+            let db = c.center.2 - primaryColour.2
+            if dl * dl + da * da + db * db > contrastThresholdSq {
+                return (primaryColour, c.center)
+            }
+        }
+        return (primaryColour, primaryColour)
+    }
+
     struct Sea {
-        var colour: (Int, Int, Int)
+        /// Primary colour — for text words, the most-populated cluster
+        /// inside the tight box (often the text colour). For non-text
+        /// boxes, the mean of perimeter samples.
+        var primaryColour: (Int, Int, Int)
+        /// Secondary colour — the first contrasting cluster (> 30 LAB
+        /// units from primary) for text words; equal to `primaryColour`
+        /// for non-text boxes (degenerate single-colour pair).
+        var secondaryColour: (Int, Int, Int)
         var members: [Box]
     }
 
-    /// Direct port of `_group_boxes_to_seas`: grow seas in encounter order, only
-    /// joining a sea if its colour is within `colorThreshold[0]` (LAB-Euclidean).
-    private func groupIntoSeas(boxes: [Box], colours: [(Int, Int, Int)]) -> [Sea] {
+    /// Compare two colour pairs for sea-membership equivalence.
+    ///
+    /// Cases:
+    ///   * Both pairs degenerate (single colour): match if those colours
+    ///     are within `t²` LAB distance squared. Standard single-colour
+    ///     comparison.
+    ///   * One degenerate, one distinct: match if the degenerate colour
+    ///     is within `t²` of *either* colour in the distinct pair. This
+    ///     handles the caption-and-anchor case — a chart with perimeter
+    ///     colour X is in the same sea as a word with background X and
+    ///     any text colour, so captions don't need cross-sea linking.
+    ///   * Both distinct: match if some pairing of colours puts both
+    ///     pairs of corresponding colours within `t²`. Two words on the
+    ///     same background with the same text colour share a sea even if
+    ///     primary/secondary roles are swapped between them; two words
+    ///     with the same background but *different* text colours
+    ///     (highlighted link in a paragraph, say) do *not* share — that's
+    ///     an accepted trade-off for cleanly handling the underline case.
+    private func seaPairsMatch(_ a: ((Int, Int, Int), (Int, Int, Int)),
+                                _ b: ((Int, Int, Int), (Int, Int, Int)),
+                                tSq: Int) -> Bool {
+        let aDegen = labDistanceSq(a.0, a.1) < tSq
+        let bDegen = labDistanceSq(b.0, b.1) < tSq
+        if aDegen && bDegen {
+            return labDistanceSq(a.0, b.0) < tSq
+        }
+        if aDegen {
+            return labDistanceSq(a.0, b.0) < tSq || labDistanceSq(a.0, b.1) < tSq
+        }
+        if bDegen {
+            return labDistanceSq(b.0, a.0) < tSq || labDistanceSq(b.0, a.1) < tSq
+        }
+        return (labDistanceSq(a.0, b.0) < tSq && labDistanceSq(a.1, b.1) < tSq)
+            || (labDistanceSq(a.0, b.1) < tSq && labDistanceSq(a.1, b.0) < tSq)
+    }
+
+    @inline(__always)
+    private func labDistanceSq(_ a: (Int, Int, Int), _ b: (Int, Int, Int)) -> Int {
+        let dl = a.0 - b.0, da = a.1 - b.1, db = a.2 - b.2
+        return dl * dl + da * da + db * db
+    }
+
+    /// Grow seas in encounter order using pair-based matching. A new box
+    /// joins the first existing sea whose colour pair matches its own
+    /// (`seaPairsMatch`); otherwise it starts a new sea.
+    private func groupIntoSeas(
+        boxes: [Box],
+        colours: [((Int, Int, Int), (Int, Int, Int))]
+    ) -> [Sea] {
         var seas: [Sea] = []
         let t = colorThreshold.0
-        let t2 = t * t
-        for (box, colour) in zip(boxes, colours) {
+        let tSq = t * t
+        for (box, pair) in zip(boxes, colours) {
             var joined = false
             for i in 0..<seas.count {
-                let c = seas[i].colour
-                let dl = c.0 - colour.0, da = c.1 - colour.1, db = c.2 - colour.2
-                if dl * dl + da * da + db * db < t2 {
+                let seaPair = (seas[i].primaryColour, seas[i].secondaryColour)
+                if seaPairsMatch(seaPair, pair, tSq: tSq) {
                     seas[i].members.append(box)
                     joined = true
                     break
                 }
             }
-            if !joined { seas.append(Sea(colour: colour, members: [box])) }
+            if !joined {
+                seas.append(Sea(primaryColour: pair.0,
+                                secondaryColour: pair.1,
+                                members: [box]))
+            }
         }
         return seas
     }
@@ -231,19 +493,30 @@ struct BoxFinder {
 
     /// One main pass plus several post-processing passes, run in order:
     ///   * Per-sea pairwise `connectionProbability`, threshold 0.5.
-    ///   * `pruneOutlierConnections` first — clean up the per-pair pass before
-    ///     the additive series/caption passes use it as their starting point;
-    ///     an outlier edge would otherwise drag in its neighbour-set during
-    ///     those passes and survive intact.
+    ///   * `pruneOutlierConnections` — area-median outlier pruning. Runs
+    ///     first so the additive series/caption passes start from a clean
+    ///     base; an outlier edge here would otherwise drag in its
+    ///     neighbour-set during those passes and survive intact.
     ///   * `connectAlignedSeries` for stacked rows / inline text segments.
-    ///   * `connectCaptions` for short labels above/below substantial anchors.
-    ///   * `pruneCrossingConnections` last — drop any edge whose shortest
-    ///     connecting segment cuts through an unrelated box.
+    ///   * `connectCaptions` — OCR-aware text-label-to-anchor linker.
+    ///   * `pruneCrossingConnections` — drop edges whose shortest connecting
+    ///     segment cuts through an unrelated box.
+    ///   * `pruneParagraphAnchors` (phase 5) — for words living in a
+    ///     paragraph of N≥30 words, drop links to giant non-text neighbours.
+    ///     A single caption legitimately attaches to a figure; a body
+    ///     paragraph does not.
+    ///   * `applyHeadingAsymmetry` (phase 3) — for heading-sized words,
+    ///     suppress the `body → heading` direction so cluster-expansion
+    ///     from a heading pulls in its body, but never the reverse.
     ///
     /// Engulfment is never connected. The Python `_connect_noisy_boxes` step that
     /// linked nested children to their containing parent is intentionally absent
     /// here — full containment splits cluster intent more often than it helps.
-    private func buildNetwork(boxes: [Box], seas: [Sea]) -> [Box: [Box]] {
+    private func buildNetwork(boxes: [Box], seas: [Sea],
+                              tags: [Box: BoxKind],
+                              lineToParagraph: [Int: Int],
+                              paragraphSize: [Int: Int],
+                              medianWordArea: Double) -> [Box: [Box]] {
         var network: [Box: [Box]] = [:]
 
         // The merge distance is intentionally derived from the Python-reference
@@ -260,10 +533,9 @@ struct BoxFinder {
                 var connections: [Box] = []
                 let boxArea = Double(box.area)
                 for other in sea.members where other != box {
-                    // Asymmetry: a much-smaller box never gains a forward edge
-                    // to a much-larger one. The connection probability formula
-                    // already disfavours this direction, but enforce it
-                    // explicitly so the rule is uniform across all passes.
+                    // Asymmetric area gate — much-smaller boxes don't get
+                    // forward edges to much-larger ones, regardless of
+                    // probability. Existing rule.
                     if boxArea * asymRatio < Double(other.area) { continue }
                     if box.connectionProbability(other, mergeDistance: mergeDistance) > 0.5 {
                         connections.append(other)
@@ -274,9 +546,23 @@ struct BoxFinder {
         }
 
         pruneOutlierConnections(network: &network)
-        connectAlignedSeries(seas: seas, network: &network, mergeDistance: mergeDistance)
-        connectCaptions(seas: seas, network: &network, mergeDistance: mergeDistance)
+        connectAlignedSeries(seas: seas, tags: tags,
+                             network: &network, mergeDistance: mergeDistance)
+        connectCaptions(boxes: boxes, tags: tags, seas: seas,
+                        lineToParagraph: lineToParagraph,
+                        paragraphSize: paragraphSize,
+                        network: &network, mergeDistance: mergeDistance)
         pruneCrossingConnections(boxes: boxes, network: &network)
+        pruneLargeBoxConnections(tags: tags,
+                                 lineToParagraph: lineToParagraph,
+                                 paragraphSize: paragraphSize,
+                                 medianWordArea: medianWordArea,
+                                 network: &network)
+        pruneParagraphAnchors(tags: tags,
+                              lineToParagraph: lineToParagraph,
+                              paragraphSize: paragraphSize,
+                              network: &network)
+        applyHeadingAsymmetry(tags: tags, network: &network)
         return network
     }
 
@@ -461,68 +747,131 @@ struct BoxFinder {
         return tmin < tmax
     }
 
-    /// Link a much-smaller box (label, title, caption) to a substantial anchor
-    /// directly above or below it. The other passes deliberately reject pairs
-    /// whose heights differ wildly — without that gate, aligned-series glues
-    /// unrelated cells together — but legitimate captions are exactly that
-    /// shape: a 20px text label above a 600px figure, or a 30px legend right
-    /// under a 400px panel. This pass restores those links under these gates:
-    ///   * `small.height ≤ 0.4 × big.height` (caption ratio)
-    ///   * `big` is itself substantial (min dim ≥ `largeBoxThreshold`)
-    ///   * `small` sits strictly above or below `big`
-    ///   * If `small` is wider than `big`, it must also be proportionally very
-    ///     thin (≤ 5% of `big.height`) and no wider than 1.5× — wide-and-short
-    ///     reads as a long descriptive title; wide-and-medium-height reads as
-    ///     a peer code cell.
-    ///   * x-overlap covers ≥ 40% of `small.width` — tolerates slight
-    ///     misalignment without letting an unrelated paragraph word qualify
-    ///   * vertical gap ≤ 3 × `small.height`, both directions. The same
-    ///     budget works for chart titles directly above a figure and for
-    ///     x-axis titles that sit beneath a row of tick labels.
-    /// Same-sea only; cross-sea captions are too risky without colour evidence.
-    private func connectCaptions(seas: [Sea], network: inout [Box: [Box]],
+    /// Link a `.word` to a substantial `.nonText` anchor whenever the
+    /// word sits very close to one of the anchor's edges — a chart title
+    /// above a plot, an axis label below a row of ticks, a legend right
+    /// next to a panel.
+    ///
+    /// Gates (in order):
+    ///   * Anchor must be substantial (`min(w, h) ≥ largeBoxThreshold`).
+    ///   * `word.height ≤ 0.4 × anchor.height`.
+    ///   * Same sea (cross-sea is too eager when applied broadly).
+    ///   * **Direction-aware edge proximity**. Edge-to-edge gaps (not
+    ///     centre-to-centre); same proximity budget on each axis:
+    ///     `budget = min(anchor.width, anchor.height) / 8`.
+    ///       * x-overlap > 0, y-overlap = 0 (word above or below):
+    ///         require `y-gap ≤ budget`.
+    ///       * y-overlap > 0, x-overlap = 0 (word to the side of):
+    ///         require `x-gap ≤ budget`.
+    ///       * Both overlap (word inside anchor): reject — that's a
+    ///         label on top of the box, not a caption around its edge.
+    ///       * Neither overlap (corner-position): reject — captions sit
+    ///         on an edge.
+    ///
+    /// Using the smaller of `width/8` and `height/8` keeps elongated
+    /// anchors (e.g. a 1000×120 banner) from adopting captions that are
+    /// far away along their shorter axis — `height/8` is the relevant
+    /// scale there, not `width/8`.
+    ///
+    /// Multi-word lines propagate: once any word on a Vision line links
+    /// to an anchor, every word with the same `lineID` links too. Keeps
+    /// "Time (s)" intact when only the first word passed proximity.
+    private func connectCaptions(boxes: [Box],
+                                 tags: [Box: BoxKind],
+                                 seas: [Sea],
+                                 lineToParagraph: [Int: Int],
+                                 paragraphSize: [Int: Int],
+                                 network: inout [Box: [Box]],
                                  mergeDistance: Double) {
         let largeThreshold = largeBoxThreshold(mergeDistance)
-        for sea in seas where sea.members.count > 1 {
-            let members = sea.members
-            for i in 0..<members.count {
-                for j in (i + 1)..<members.count {
-                    let a = members[i], b = members[j]
-                    let small: Box, big: Box
-                    if a.height < b.height { small = a; big = b }
-                    else                   { small = b; big = a }
+        // Single proximity budget shared by both axes:
+        // `min(anchor.width, anchor.height) / 8`. Edge-to-edge gaps.
+        // For non-square anchors the shorter axis controls — a 1000×120
+        // banner uses 15 (= 120/8), not 125, as the cap.
+        let proximityDivisor: Double = 8.0
 
-                    if Double(small.height) > Double(big.height) * 0.4 { continue }
-                    if Double(min(big.width, big.height)) < largeThreshold { continue }
-                    // A caption *can* be slightly wider than the anchor (long
-                    // descriptive titles, axis labels that extend past the
-                    // plot's box), but only if it's proportionally very thin —
-                    // wide-and-short reads as a title; wide-and-medium-height
-                    // is a peer code cell.
-                    if small.width > big.width {
-                        if small.width > big.width * 3 / 2 { continue }
-                        if Double(small.height) > Double(big.height) * 0.05 { continue }
-                    }
+        var words: [Box] = []
+        var anchors: [Box] = []
+        for box in boxes {
+            switch tags[box] {
+            case .word:         words.append(box)
+            case .nonText, nil: anchors.append(box)
+            }
+        }
 
-                    let above = small.bottom <= big.top
-                    let below = small.top    >= big.bottom
-                    guard above || below else { continue }
+        var seaOf: [Box: Int] = [:]
+        seaOf.reserveCapacity(boxes.count)
+        for (idx, sea) in seas.enumerated() {
+            for box in sea.members { seaOf[box] = idx }
+        }
 
-                    let xOverlap = min(small.right, big.right) - max(small.left, big.left)
-                    if xOverlap <= 0 { continue }
-                    // 40% lets a title sit slightly off-centre without losing
-                    // the link; tight enough that an unrelated paragraph word
-                    // that happens to project under the figure still misses.
-                    if Double(xOverlap) < Double(small.width) * 0.4 { continue }
+        var captionEdges: [(word: Box, anchor: Box)] = []
+        for word in words {
+            for anchor in anchors {
+                if Double(min(anchor.width, anchor.height)) < largeThreshold { continue }
+                if Double(word.height) > Double(anchor.height) * 0.4 { continue }
 
-                    let gap = above ? (big.top - small.bottom) : (small.top - big.bottom)
-                    // Equal budget above and below — x-axis titles sit beneath
-                    // tick labels and need the same room as a chart title
-                    // sitting above its plot.
-                    let budget = Double(small.height) * 3.0
-                    if Double(gap) > budget { continue }
+                // Same-sea only — captions across colour boundaries are
+                // too risky without per-element grouping evidence.
+                if let wordSea = seaOf[word], let anchorSea = seaOf[anchor],
+                   wordSea != anchorSea { continue }
 
-                    linkBoxes(small, big, network: &network)
+                let xOverlap = min(word.right, anchor.right) - max(word.left, anchor.left)
+                let yOverlap = min(word.bottom, anchor.bottom) - max(word.top, anchor.top)
+
+                if xOverlap > 0 && yOverlap > 0 {
+                    // Word is inside the anchor — label, not caption.
+                    continue
+                }
+
+                let budget = Double(min(anchor.width, anchor.height)) / proximityDivisor
+
+                if xOverlap > 0 {
+                    // Word above or below — check the edge-to-edge y-gap.
+                    let yGap = word.bottom <= anchor.top
+                        ? anchor.top - word.bottom
+                        : word.top - anchor.bottom
+                    if Double(yGap) > budget { continue }
+                } else if yOverlap > 0 {
+                    // Word to the side — check the edge-to-edge x-gap.
+                    let xGap = word.right <= anchor.left
+                        ? anchor.left - word.right
+                        : word.left - anchor.right
+                    if Double(xGap) > budget { continue }
+                } else {
+                    // No overlap on either axis — corner position. Reject.
+                    continue
+                }
+
+                captionEdges.append((word, anchor))
+            }
+        }
+
+        for (w, a) in captionEdges {
+            linkBoxes(w, a, network: &network)
+        }
+
+        // Line propagation — once any word on a Vision line links to an
+        // anchor, every word with the same `lineID` links too. Multi-
+        // word captions like "Time (s)" stay intact even when only one
+        // of the words passed the proximity gate.
+        var wordsByLine: [Int: [Box]] = [:]
+        for word in words {
+            if case let .word(_, _, lineID) = tags[word] {
+                wordsByLine[lineID, default: []].append(word)
+            }
+        }
+        var anchorsByLine: [Int: Set<Box>] = [:]
+        for (w, a) in captionEdges {
+            if case let .word(_, _, lineID) = tags[w] {
+                anchorsByLine[lineID, default: []].insert(a)
+            }
+        }
+        for (lineID, anchorSet) in anchorsByLine {
+            guard let lineWords = wordsByLine[lineID] else { continue }
+            for anchor in anchorSet {
+                for w in lineWords {
+                    linkBoxes(w, anchor, network: &network)
                 }
             }
         }
@@ -575,11 +924,31 @@ struct BoxFinder {
     /// shared property is consistent *thickness* (height) along with a low gap
     /// in the other dimension; widths can differ wildly (e.g. "def" vs.
     /// "hello_world"), so we never gate on width similarity.
-    private func connectAlignedSeries(seas: [Sea], network: inout [Box: [Box]],
+    ///
+    /// Text-text relaxation: when both boxes are tagged `.word`, the gates
+    /// relax — the heightRatio gate drops, `projectionMin` shrinks to 0.3,
+    /// and the gap budget grows to 2.5× avg height. Rationale:
+    ///   * Words on the same line connect even with awkward x-overlap (a
+    ///     thin "(s)" next to "Time" doesn't satisfy the 50% projection
+    ///     gate, but they should still chain).
+    ///   * Words in adjacent lines connect across the typical inter-line
+    ///     gap, which can exceed 1.5× avg height especially in spacious
+    ///     layouts.
+    ///   * Heading-vs-body height ratios that fail the 0.7 default now
+    ///     link bidirectionally; `applyHeadingAsymmetry` strips the
+    ///     `body → heading` direction afterward, leaving the desired
+    ///     "heading expands to body" behaviour.
+    /// Non-text or mixed pairs keep the original stricter gates so an
+    /// icon-vs-label or chart-vs-tick pair doesn't get glued.
+    private func connectAlignedSeries(seas: [Sea],
+                                      tags: [Box: BoxKind],
+                                      network: inout [Box: [Box]],
                                       mergeDistance: Double) {
-        let heightRatioMin: Double = 0.7   // heights within 30% of each other
-        let projectionMin:  Double = 0.5   // ≥ 50% overlap on the perpendicular axis
-        let gapFactor:      Double = 1.5   // gap ≤ 1.5× avg height
+        let heightRatioMin: Double = 0.7
+        let projectionMin:  Double = 0.5
+        let gapFactor:      Double = 1.5
+        let textProjectionMin: Double = 0.3
+        let textGapFactor:     Double = 2.5
         let largeThreshold = largeBoxThreshold(mergeDistance)
 
         for sea in seas where sea.members.count > 1 {
@@ -597,41 +966,50 @@ struct BoxFinder {
                     let bLarge = Double(min(b.width, b.height)) > largeThreshold
                     if aLarge && bLarge { continue }
 
+                    let aWord: Bool
+                    if case .word = tags[a] { aWord = true } else { aWord = false }
+                    let bWord: Bool
+                    if case .word = tags[b] { bWord = true } else { bWord = false }
+                    let bothText = aWord && bWord
+
                     let xOverlap = min(a.right,  b.right)  - max(a.left, b.left)
                     let yOverlap = min(a.bottom, b.bottom) - max(a.top,  b.top)
 
                     let hRatio = Double(min(a.height, b.height)) / Double(max(a.height, b.height))
                     let avgH = Double(a.height + b.height) / 2.0
 
+                    let effProjectionMin = bothText ? textProjectionMin : projectionMin
+                    let effGapFactor     = bothText ? textGapFactor     : gapFactor
+                    let effHeightGate    = bothText ? 0.0                : heightRatioMin
+
                     var connect = false
 
                     // Horizontal series — words on the same line, tab strips, etc.
-                    // y-projections overlap (boxes share the same row), heights
-                    // are similar, x-gap is small relative to the row height.
                     if yOverlap > 0 && xOverlap <= 0 {
                         let yFrac = Double(yOverlap) / Double(min(a.height, b.height))
                         let xGap  = Double(-xOverlap)
-                        if yFrac >= projectionMin && hRatio >= heightRatioMin
-                            && xGap <= avgH * gapFactor {
+                        if yFrac >= effProjectionMin && hRatio >= effHeightGate
+                            && xGap <= avgH * effGapFactor {
                             connect = true
                         }
                     }
 
                     // Vertical stack — code lines, list rows, paragraph blocks.
-                    // x-projections overlap, heights similar, y-gap ≤ avg height.
-                    // Width ratio also has to be reasonable: a 15px-wide tick
-                    // label sitting under a 900px code cell shares a column on
-                    // a `min(widths)` basis but absolutely isn't part of the
-                    // same row, and without this gate the tick→cell-below link
-                    // transitively pulls in the wrong cell when the user picks
-                    // a figure above the tick.
+                    // x-projections overlap, heights similar, y-gap small.
+                    // Width ratio gate keeps a 15px tick label from chaining
+                    // to a 900px code cell beneath it just because they share
+                    // a column on a `min(widths)` basis — but that gate only
+                    // makes sense when at least one side is non-text; two
+                    // text words of wildly different widths ("of" vs.
+                    // "Comparison") legitimately belong in the same column.
                     if !connect && xOverlap > 0 && yOverlap <= 0 {
                         let xFrac = Double(xOverlap) / Double(min(a.width, b.width))
                         let widthRatio = Double(min(a.width, b.width)) / Double(max(a.width, b.width))
+                        let widthGate = bothText ? 0.0 : 0.3
                         let yGap  = Double(-yOverlap)
-                        if xFrac >= projectionMin && hRatio >= heightRatioMin
-                            && widthRatio >= 0.3
-                            && yGap <= avgH * gapFactor {
+                        if xFrac >= effProjectionMin && hRatio >= effHeightGate
+                            && widthRatio >= widthGate
+                            && yGap <= avgH * effGapFactor {
                             connect = true
                         }
                     }
@@ -640,6 +1018,373 @@ struct BoxFinder {
                     linkBoxes(a, b, network: &network)
                 }
             }
+        }
+    }
+
+    // MARK: - OCR-driven box cleanups (phase 4)
+
+    /// Drop CC boxes that are sub-parts of a Vision word — the dot of "i",
+    /// the inner counter of "o", a stem fragment that connected-components
+    /// labelled as its own region. These pollute the network with
+    /// text-internal links and serve no useful selection purpose.
+    ///
+    /// A box `B` is sub-letter if some Vision word `W` covers ≥ 80% of
+    /// `B`'s area and `W` is at least 2× larger than `B`. The 2× size
+    /// guard prevents the rule from firing on a tight UI element whose
+    /// bounds happen to closely match its embedded text (a small button
+    /// labelled "OK", say) — the word and the surrounding box have
+    /// similar areas there, so the guard rejects the pruning.
+    private func dropSubLetterBoxes(_ boxes: [Box],
+                                    words: [RecognizedWord]) -> [Box] {
+        let coverageRequired: Double = 0.8
+        let minSizeRatio: Double = 2.0
+        return boxes.filter { box in
+            for word in words {
+                let inter = word.box.overlap(box)
+                guard inter > 0 else { continue }
+                let coverage = inter / Double(box.area)
+                if coverage >= coverageRequired
+                    && Double(word.box.area) >= Double(box.area) * minSizeRatio {
+                    return false
+                }
+            }
+            return true
+        }
+    }
+
+    /// OCR-first box selection. In regions Vision identifies as text,
+    /// prefer Vision's word-level boxes over the coarser CC ones. The
+    /// motivation is twofold: (1) CC's morphology kernel is one-size-fits-
+    /// all and chronically glues multiple words at small font sizes,
+    /// producing a single CC region where the user wanted word-level
+    /// granularity; (2) Vision detects words that CC sometimes misses
+    /// entirely (low-contrast text, tight ligatures, unusual fonts), and
+    /// without this step those words never become selectable.
+    ///
+    /// Algorithm:
+    ///   1. For each CC box, compute the total Vision-word area
+    ///      substantially inside it (≥ 50% of word area in the CC box).
+    ///      If that area covers ≥ 50% of the CC box's area, the CC is a
+    ///      "text region" — drop it. Vision word boxes added in step 2
+    ///      take its place.
+    ///   2. Add every Vision word box to the selectable list (deduped by
+    ///      `Box` equality). Words inside a kept CC (e.g. the label on a
+    ///      button) are added in addition to the CC, so both become
+    ///      selectable; words inside a dropped text-region CC are
+    ///      introduced here for the first time; words that no CC box ever
+    ///      saw are recovered.
+    ///
+    /// The 50% coverage gate distinguishes text regions (line of body
+    /// text, wide heading) from UI containers that happen to hold text (a
+    /// button labelled "Save now") — the latter typically have far more
+    /// non-text area than text, so the gate doesn't fire and the
+    /// container stays whole alongside its word boxes.
+    private func applyVisionBoxes(_ boxes: [Box],
+                                  words: [RecognizedWord]) -> [Box] {
+        let wordCoverageInBox: Double = 0.5
+        let dropCoverage: Double = 0.5
+
+        var dropped: Set<Box> = []
+        for box in boxes {
+            var totalWordArea = 0
+            for w in words {
+                let inter = box.overlap(w.box)
+                guard inter > 0 else { continue }
+                if inter / Double(w.box.area) < wordCoverageInBox { continue }
+                totalWordArea += w.box.area
+            }
+            if Double(totalWordArea) >= Double(box.area) * dropCoverage {
+                dropped.insert(box)
+            }
+        }
+
+        var seen: Set<Box> = []
+        var result: [Box] = []
+        result.reserveCapacity(boxes.count + words.count)
+        for box in boxes where !dropped.contains(box) {
+            if seen.insert(box).inserted { result.append(box) }
+        }
+        for word in words {
+            if seen.insert(word.box).inserted { result.append(word.box) }
+        }
+        return result
+    }
+
+    // MARK: - Paragraph-aware pruning (phase 5)
+
+    /// Group Vision lines into paragraphs by vertical adjacency + x-extent
+    /// overlap, using union-find so multi-column layouts don't break apart
+    /// when lines interleave by y-position. Two lines join the same
+    /// paragraph when:
+    ///   * `y-gap ≤ avg(line heights)` (within typical line spacing), and
+    ///   * `x-overlap ≥ 30% × min(line widths)` (share a column).
+    ///
+    /// Returns `lineID → paragraphIndex`. A standalone line that doesn't
+    /// chain to any neighbour ends up in a paragraph of size 1, which the
+    /// classifier downstream treats as a one-word caption / label.
+    ///
+    /// Why union-find instead of pairwise-consecutive: with two columns of
+    /// body text running side by side, sorting by `top` interleaves them
+    /// (A1, B1, A2, B2, ...). A consecutive-pair walk would never link A1
+    /// to A2 because B1 sits between them in the sorted order. Union-find
+    /// on all qualifying pairs preserves column structure.
+    private func paragraphIndex(for words: [RecognizedWord]) -> [Int: Int] {
+        var byLine: [Int: [RecognizedWord]] = [:]
+        for w in words { byLine[w.lineID, default: []].append(w) }
+        if byLine.isEmpty { return [:] }
+
+        struct LineBox { let id: Int; let box: Box }
+        var lines: [LineBox] = []
+        for (id, lineWords) in byLine {
+            let xMin = lineWords.map { $0.box.left }.min() ?? 0
+            let xMax = lineWords.map { $0.box.right }.max() ?? 0
+            let yMin = lineWords.map { $0.box.top }.min() ?? 0
+            let yMax = lineWords.map { $0.box.bottom }.max() ?? 0
+            lines.append(LineBox(id: id, box: Box(
+                x: xMin, y: yMin,
+                width: max(1, xMax - xMin),
+                height: max(1, yMax - yMin)
+            )))
+        }
+
+        let yGapFactor: Double = 1.0
+        let xOverlapFraction: Double = 0.3
+
+        var parent = Array(0..<lines.count)
+        func find(_ x: Int) -> Int {
+            var cur = x
+            while parent[cur] != cur {
+                parent[cur] = parent[parent[cur]]
+                cur = parent[cur]
+            }
+            return cur
+        }
+        for i in 0..<lines.count {
+            for j in (i + 1)..<lines.count {
+                let a = lines[i].box, b = lines[j].box
+                let yDist: Int
+                if a.bottom <= b.top {
+                    yDist = b.top - a.bottom
+                } else if b.bottom <= a.top {
+                    yDist = a.top - b.bottom
+                } else {
+                    yDist = 0
+                }
+                let avgH = (a.height + b.height) / 2
+                if Double(yDist) > Double(avgH) * yGapFactor { continue }
+                let xOverlap = min(a.right, b.right) - max(a.left, b.left)
+                if xOverlap <= 0 { continue }
+                let minW = min(a.width, b.width)
+                if Double(xOverlap) < Double(minW) * xOverlapFraction { continue }
+                let ra = find(i), rb = find(j)
+                if ra != rb { parent[ra] = rb }
+            }
+        }
+
+        var rootToPara: [Int: Int] = [:]
+        var nextPara = 0
+        var paraOfLine: [Int: Int] = [:]
+        for i in 0..<lines.count {
+            let root = find(i)
+            if rootToPara[root] == nil {
+                rootToPara[root] = nextPara
+                nextPara += 1
+            }
+            paraOfLine[lines[i].id] = rootToPara[root]
+        }
+        return paraOfLine
+    }
+
+    /// Compute `paragraphIndex → word count` from a Vision word list and a
+    /// `lineID → paragraphIndex` map. The size is the total number of
+    /// Vision words in the paragraph, regardless of how many of them
+    /// survived later filtering — we're classifying *the text's nature*
+    /// (caption / sentence / paragraph), and a missed word in the
+    /// selectable pipeline shouldn't change that classification.
+    private func paragraphSizes(words: [RecognizedWord],
+                                lineToParagraph: [Int: Int]) -> [Int: Int] {
+        var sizes: [Int: Int] = [:]
+        for w in words {
+            guard let para = lineToParagraph[w.lineID] else { continue }
+            sizes[para, default: 0] += 1
+        }
+        return sizes
+    }
+
+    // MARK: - Large-box edge restriction
+
+    /// Restrict the neighbour set of "large" non-text boxes (figures,
+    /// panels, charts — anything that can hold ≥ 20 typical words) to
+    /// caption-tier text only. Two large boxes never link to each other;
+    /// a large box never links to a sentence or paragraph word.
+    ///
+    /// Definition of "large": `area > 20 × medianWordArea`. Median (not
+    /// mean) so that a banner-text outlier in the Vision output doesn't
+    /// shift the threshold.
+    ///
+    /// Runs as a post-process pass after `connectCaptions` so caption
+    /// edges added there (which already passed the 1/8 proximity gate)
+    /// survive, while the per-sea pairwise's "everything in the same sea
+    /// can connect" promiscuity is reined in.
+    private func pruneLargeBoxConnections(tags: [Box: BoxKind],
+                                          lineToParagraph: [Int: Int],
+                                          paragraphSize: [Int: Int],
+                                          medianWordArea: Double,
+                                          network: inout [Box: [Box]]) {
+        let captionMaxWords = 5
+        let largeAreaThreshold = medianWordArea * 20.0
+
+        var largeBoxes: Set<Box> = []
+        for (box, kind) in tags {
+            guard case .nonText = kind else { continue }
+            if Double(box.area) > largeAreaThreshold {
+                largeBoxes.insert(box)
+            }
+        }
+        if largeBoxes.isEmpty { return }
+
+        var toPrune: [(Box, Box)] = []
+        for largeBox in largeBoxes {
+            guard let neighbours = network[largeBox] else { continue }
+            for n in neighbours {
+                if largeBoxes.contains(n) {
+                    toPrune.append((largeBox, n))
+                    continue
+                }
+                if case let .word(_, _, lineID) = tags[n] {
+                    let size = lineToParagraph[lineID]
+                        .flatMap { paragraphSize[$0] } ?? 1
+                    if size > captionMaxWords {
+                        toPrune.append((largeBox, n))
+                    }
+                }
+            }
+        }
+
+        for (a, b) in toPrune {
+            network[a]?.removeAll { $0 == b }
+            network[b]?.removeAll { $0 == a }
+        }
+    }
+
+    // MARK: - Paragraph-aware pruning
+
+    /// Two responsibilities:
+    ///
+    /// 1. **Tiered word ↔ non-text prune.** A `.word` is classified by
+    ///    paragraph size and large `.nonText` neighbours are pruned
+    ///    accordingly:
+    ///      * **Paragraph** (> 20 words): prune `.nonText` neighbours
+    ///        larger than `5 × median(word area)`.
+    ///      * **Sentence** (10–20 words): prune `.nonText` neighbours
+    ///        larger than `20 × median(word area)`.
+    ///      * **Caption** (≤ 10 words): not subject to this rule.
+    ///
+    /// 2. **Cross-paragraph word ↔ word prune.** Any `.word` ↔ `.word`
+    ///    edge spanning different Vision paragraphs is cut. The
+    ///    aligned-series gate is geometry-only; paragraph identity is
+    ///    the logical-grouping boundary those edges shouldn't cross.
+    private func pruneParagraphAnchors(tags: [Box: BoxKind],
+                                       lineToParagraph: [Int: Int],
+                                       paragraphSize: [Int: Int],
+                                       network: inout [Box: [Box]]) {
+        let captionMaxWords = 10
+        let sentenceMaxWords = 20
+        let paragraphMultiplier: Double = 5.0
+        let sentenceMultiplier: Double = 20.0
+
+        var wordsByParagraph: [Int: [Box]] = [:]
+        var paragraphOfBox: [Box: Int] = [:]
+        for (box, kind) in tags {
+            guard case let .word(_, _, lineID) = kind,
+                  let para = lineToParagraph[lineID] else { continue }
+            wordsByParagraph[para, default: []].append(box)
+            paragraphOfBox[box] = para
+        }
+
+        var toPrune: [(Box, Box)] = []
+
+        // (1) Tiered word ↔ non-text.
+        for (paraIdx, paraBoxes) in wordsByParagraph {
+            let size = paragraphSize[paraIdx] ?? paraBoxes.count
+            let multiplier: Double
+            if size > sentenceMaxWords      { multiplier = paragraphMultiplier }
+            else if size > captionMaxWords  { multiplier = sentenceMultiplier }
+            else                            { continue }
+            let areas = paraBoxes.map { Double($0.area) }.sorted()
+            let median = areas[areas.count / 2]
+            guard median > 0 else { continue }
+            let threshold = median * multiplier
+
+            for word in paraBoxes {
+                guard let neighbours = network[word] else { continue }
+                for n in neighbours {
+                    guard case .nonText = tags[n] else { continue }
+                    if Double(n.area) > threshold {
+                        toPrune.append((word, n))
+                    }
+                }
+            }
+        }
+
+        // (2) Cross-paragraph word ↔ word.
+        for (word, paraA) in paragraphOfBox {
+            guard let neighbours = network[word] else { continue }
+            for n in neighbours {
+                guard let paraB = paragraphOfBox[n] else { continue }
+                if paraA != paraB {
+                    toPrune.append((word, n))
+                }
+            }
+        }
+
+        for (a, b) in toPrune {
+            network[a]?.removeAll { $0 == b }
+            network[b]?.removeAll { $0 == a }
+        }
+    }
+
+    // MARK: - Heading / body directional asymmetry (phase 3)
+
+    /// Suppress `body → heading` edges so cluster expansion from a heading
+    /// pulls in its body, but never the reverse. A `.word` box is a
+    /// "heading" when its height exceeds `1.5 ×` the median word height in
+    /// the screenshot; everything else `.word` is "body".
+    ///
+    /// The asymmetry applies only to `.word → .word` edges. Word-to-anchor
+    /// links (a heading-sized title above a chart, an axis label below a
+    /// plot) remain bidirectional — the user typically wants the chart and
+    /// its title to expand together regardless of which side they hover.
+    ///
+    /// We don't add new edges here: linking heading to body is handled by
+    /// the per-sea pairwise / aligned-series passes when their gates
+    /// admit. The asymmetry pass is purely subtractive on the existing
+    /// graph, which keeps it a safe final-cleanup step.
+    private func applyHeadingAsymmetry(tags: [Box: BoxKind],
+                                       network: inout [Box: [Box]]) {
+        var heights: [Int] = []
+        for (box, kind) in tags {
+            if case .word = kind { heights.append(box.height) }
+        }
+        if heights.count < 3 { return }   // not enough text to call a median
+        heights.sort()
+        let median = Double(heights[heights.count / 2])
+        let headingThreshold = median * 1.5
+
+        var headingBoxes = Set<Box>()
+        for (box, kind) in tags {
+            if case .word = kind, Double(box.height) > headingThreshold {
+                headingBoxes.insert(box)
+            }
+        }
+        if headingBoxes.isEmpty { return }
+
+        // Drop heading neighbours from each body word's forward edge list.
+        let keys = Array(network.keys)
+        for box in keys {
+            guard case .word = tags[box] else { continue }
+            if headingBoxes.contains(box) { continue }
+            network[box]?.removeAll { headingBoxes.contains($0) }
         }
     }
 

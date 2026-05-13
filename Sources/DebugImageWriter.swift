@@ -10,6 +10,12 @@ import UniformTypeIdentifiers
 ///   * `1_edges.png`      — Canny edges before morphology
 ///   * `2_seas.png`       — selectable boxes coloured by sea membership
 ///   * `3_connections.png`— the final adjacency network as directed arrows
+///   * `4_ocr.png`        — Vision-line paragraph classification: red
+///                          fills around paragraphs (>20 words), cyan
+///                          fills around captions (<10 words). Sentences
+///                          (10–20 words) are intentionally uncoloured —
+///                          they're the borderline tier the network uses
+///                          standard caption gates for.
 enum DebugImageWriter {
     static func writeIfEnabled(
         source: CGImage,
@@ -17,7 +23,10 @@ enum DebugImageWriter {
         width: Int,
         height: Int,
         seas: [BoxFinder.Sea],
-        network: [Box: [Box]]
+        network: [Box: [Box]],
+        words: [RecognizedWord],
+        lineToParagraph: [Int: Int],
+        paragraphSize: [Int: Int]
     ) {
         guard Config.debug else { return }
         let dir = Config.saveFolder
@@ -31,6 +40,11 @@ enum DebugImageWriter {
         }
         if let connectionsImg = renderConnections(on: source, network: network, seas: seas) {
             write(cgImage: connectionsImg, to: dir.appendingPathComponent("3_connections.png"))
+        }
+        if let groupsImg = renderTextGroups(on: source, words: words,
+                                            lineToParagraph: lineToParagraph,
+                                            paragraphSize: paragraphSize) {
+            write(cgImage: groupsImg, to: dir.appendingPathComponent("4_ocr.png"))
         }
     }
 
@@ -153,6 +167,74 @@ enum DebugImageWriter {
                 if forward { drawArrow(ctx, tip: p1, from: p0, size: arrowSize, color: lineColor) }
                 if reverse { drawArrow(ctx, tip: p0, from: p1, size: arrowSize, color: lineColor) }
             }
+        }
+
+        return ctx.makeImage()
+    }
+
+    /// Render the paragraph/caption classification overlay. Each Vision
+    /// paragraph (a union-find component of recognised lines) gets a
+    /// filled rectangle bounding all its words:
+    ///   * paragraph (> 20 words) — faded red
+    ///   * caption (< 10 words) — faded cyan
+    ///   * sentence (10–20 words) — left transparent
+    ///
+    /// Drawn directly over the source so the user can sanity-check which
+    /// text regions the network construction treats as candidates for
+    /// caption linking vs. paragraph anchor pruning. If a body block
+    /// shows up as cyan or transparent, the union-find didn't chain its
+    /// lines (often a column-overlap or y-gap tuning issue); if a tight
+    /// caption shows up as red, the paragraph threshold needs raising.
+    private static func renderTextGroups(on cgImage: CGImage,
+                                         words: [RecognizedWord],
+                                         lineToParagraph: [Int: Int],
+                                         paragraphSize: [Int: Int]) -> CGImage? {
+        let width = cgImage.width, height = cgImage.height
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
+        let info = CGImageAlphaInfo.premultipliedLast.rawValue
+                 | CGBitmapInfo.byteOrder32Big.rawValue
+        guard let ctx = CGContext(
+            data: nil, width: width, height: height,
+            bitsPerComponent: 8, bytesPerRow: 0, space: space, bitmapInfo: info
+        ) else { return nil }
+        ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+        let paragraphFill   = CGColor(red: 1.00, green: 0.20, blue: 0.20, alpha: 0.22)
+        let paragraphStroke = CGColor(red: 1.00, green: 0.20, blue: 0.20, alpha: 0.85)
+        let captionFill     = CGColor(red: 0.10, green: 0.75, blue: 0.90, alpha: 0.22)
+        let captionStroke   = CGColor(red: 0.10, green: 0.75, blue: 0.90, alpha: 0.85)
+
+        // Group word boxes by paragraph.
+        var byParagraph: [Int: [Box]] = [:]
+        for word in words {
+            guard let para = lineToParagraph[word.lineID] else { continue }
+            byParagraph[para, default: []].append(word.box)
+        }
+
+        ctx.setLineWidth(2)
+        for (paraIdx, boxes) in byParagraph {
+            let size = paragraphSize[paraIdx] ?? boxes.count
+            let fill: CGColor
+            let stroke: CGColor
+            if size > 20 {
+                fill = paragraphFill; stroke = paragraphStroke
+            } else if size < 10 {
+                fill = captionFill; stroke = captionStroke
+            } else {
+                continue   // sentence — uncoloured
+            }
+            let xMin = boxes.map(\.left).min()  ?? 0
+            let xMax = boxes.map(\.right).max() ?? 0
+            let yMin = boxes.map(\.top).min()   ?? 0
+            let yMax = boxes.map(\.bottom).max() ?? 0
+            let cgY = CGFloat(height - yMax)
+            let rect = CGRect(x: CGFloat(xMin), y: cgY,
+                              width:  CGFloat(xMax - xMin),
+                              height: CGFloat(yMax - yMin))
+            ctx.setFillColor(fill)
+            ctx.fill(rect)
+            ctx.setStrokeColor(stroke)
+            ctx.stroke(rect)
         }
 
         return ctx.makeImage()
