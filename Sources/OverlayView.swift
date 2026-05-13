@@ -328,8 +328,15 @@ final class OverlayView: NSView {
         ctx.restoreGState()
 
         if let anim = animRect {
-            let lineWidth: CGFloat = flowmode ? 3 : 2
-            if flowmode {
+            // Flow-mode orange is reserved for detection-driven selections.
+            // A manual drag-out rectangle stays neutral white even when
+            // flow mode is on: the orange is a signal that the underlying
+            // selection is following the detected box graph, and a custom
+            // box is precisely the user opting out of that.
+            let isManual = customBox != nil
+            let usingFlowStyle = flowmode && !isManual
+            let lineWidth: CGFloat = usingFlowStyle ? 3 : 2
+            if usingFlowStyle {
                 ctx.setStrokeColor(Config.Palette.primary.cgColor)
             } else {
                 ctx.setStrokeColor(NSColor.white.withAlphaComponent(200.0/255.0).cgColor)
@@ -677,7 +684,10 @@ final class OverlayView: NSView {
     }
 
     private func playSuccessFlash(then: (() -> Void)? = nil) {
-        guard let padded = paddedRect, let strict = encRect else { then?(); return }
+        // `encRect` only matters for the "is there a selection" guard;
+        // the midframe is now derived purely from `paddedRect` so the
+        // shrink behaviour is uniform across cluster and manual cases.
+        guard let padded = paddedRect, encRect != nil else { then?(); return }
         boxAnimator.onFinished = { [weak self] in
             self?.boxAnimator.onFinished = { [weak self] in
                 guard let self else { return }
@@ -688,8 +698,25 @@ final class OverlayView: NSView {
             }
             then?()
         }
+
+        // Always pulse inward by exactly 12 px regardless of padding —
+        // the flicker is a fixed-magnitude confirmation animation, not
+        // a function of the selection's own metrics. The midframe is
+        // allowed to pass through and even past the strict content for
+        // thin-padding or manual selections. If the box is smaller
+        // than 24 px in either axis the midframe collapses to a
+        // zero-size point in that axis and the animation bottoms out
+        // at a point.
+        let inset: CGFloat = 12
+        let midW = max(0, padded.width  - 2 * inset)
+        let midH = max(0, padded.height - 2 * inset)
+        let mid = CGRect(
+            x: padded.midX - midW / 2,
+            y: padded.midY - midH / 2,
+            width: midW, height: midH
+        )
         boxAnimator.start(duration: 0.25, easing: .inOutQuad,
-                          keyframes: [(0, padded), (0.5, strict), (1, padded)])
+                          keyframes: [(0, padded), (0.5, mid), (1, padded)])
     }
 
     // MARK: - Keys

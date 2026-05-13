@@ -2,11 +2,8 @@ import Foundation
 
 enum ConnectedComponents {
     /// Two-pass union-find connected component labelling on an 8-bit binary image
-    /// (foreground = non-zero). Returns the bounding box of every component plus
-    /// a `parent` index per component (a smallest enclosing other component, or
-    /// `-1` if there's no enclosing one). This stands in for the parent column of
-    /// OpenCV's `findContours(RETR_TREE)` hierarchy.
-    static func label(_ src: [UInt8], width w: Int, height h: Int) -> (boxes: [Box], parents: [Int]) {
+    /// (foreground = non-zero). Returns the bounding box of every component.
+    static func label(_ src: [UInt8], width w: Int, height h: Int) -> [Box] {
         var labels = [Int32](repeating: 0, count: w * h)
         var parent = [Int32](repeating: 0, count: 1)
         parent[0] = 0
@@ -82,29 +79,6 @@ enum ConnectedComponents {
                              height: maxY[r] - minY[r] + 1))
         }
 
-        // Approximate parent hierarchy: for each box, the smallest other box that
-        // strictly contains it. Quadratic but `boxes.count` is rarely > a few k.
-        let parents = approximateParents(boxes)
-        return (boxes, parents)
-    }
-
-    private static func approximateParents(_ boxes: [Box]) -> [Int] {
-        var parents = [Int](repeating: -1, count: boxes.count)
-        let indexed = boxes.enumerated().sorted(by: { $0.element.area > $1.element.area })
-        // For each box (smallest first), search the larger boxes for the smallest enclosing one.
-        for (i, box) in boxes.enumerated() {
-            var bestArea = Int.max
-            var bestIdx = -1
-            for entry in indexed {
-                if entry.offset == i { continue }
-                if entry.element.area <= box.area { continue }
-                if entry.element.contains(box) && entry.element.area < bestArea {
-                    bestArea = entry.element.area
-                    bestIdx = entry.offset
-                }
-            }
-            parents[i] = bestIdx
-        }
-        return parents
+        return boxes
     }
 }

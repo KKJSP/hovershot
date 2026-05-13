@@ -2,6 +2,75 @@ import AppKit
 import CoreGraphics
 import Foundation
 
+/// Which network-construction pass first added a given undirected edge.
+/// Pruning passes don't appear here — origins are attributed at the
+/// moment of *addition* so the debug visualisation can show which
+/// constructor is responsible for any edge that survived to the end.
+enum EdgeOrigin {
+    /// Per-sea pairwise pass in `buildNetwork` (`connectionProbability`).
+    case pairwise
+    /// `connectAlignedSeries` — rows / columns / aligned text series.
+    case alignedSeries
+    /// `connectCaptions` — word-to-large-anchor caption linking,
+    /// including the same-line propagation step.
+    case captions
+    /// `addBridgeConnections` — symmetrises edges for a box that had
+    /// incoming edges from exactly two distinct sources and no
+    /// outgoing edge to either. Overwrites the pair's prior origin
+    /// (the diagnostic value is "this pair was bridge-augmented").
+    case bridges
+}
+
+/// Canonical undirected `{a, b}` box pair so the network's two directed
+/// entries map to a single key for origin attribution and debug-arrow
+/// colouring.
+struct BoxPair: Hashable {
+    let a: Box
+    let b: Box
+    init(_ x: Box, _ y: Box) {
+        if (x.x, x.y, x.width, x.height) <= (y.x, y.y, y.width, y.height) {
+            a = x; b = y
+        } else {
+            a = y; b = x
+        }
+    }
+}
+
+/// Reference-type origin map so non-mutating `BoxFinder` helpers can
+/// record edges without each method picking up a `mutating` annotation
+/// or an extra inout parameter.
+final class EdgeOriginMap {
+    private(set) var map: [BoxPair: EdgeOrigin] = [:]
+
+    func reset() { map.removeAll(keepingCapacity: true) }
+
+    /// First-writer-wins: a pair tagged by an earlier pass keeps its
+    /// origin even if a later pass also tries to "link" it.
+    func recordIfAbsent(_ x: Box, _ y: Box, _ origin: EdgeOrigin) {
+        let pair = BoxPair(x, y)
+        if map[pair] == nil { map[pair] = origin }
+    }
+
+    /// Force-overwrite the pair's origin. Used by `addBridgeConnections`,
+    /// where the diagnostic point is precisely that the pair has been
+    /// augmented — the original directional edge's origin is less
+    /// interesting than the fact a bridge formed.
+    func setOrigin(_ x: Box, _ y: Box, _ origin: EdgeOrigin) {
+        map[BoxPair(x, y)] = origin
+    }
+
+    /// Drop origin entries for pairs no longer present in `network`.
+    /// Cheaper than instrumenting every prune site to remove eagerly.
+    func gc(against network: [Box: [Box]]) {
+        var present = Set<BoxPair>()
+        present.reserveCapacity(map.count)
+        for (from, neighbours) in network {
+            for to in neighbours { present.insert(BoxPair(from, to)) }
+        }
+        map = map.filter { present.contains($0.key) }
+    }
+}
+
 struct DetectionResult {
     let boxes: [Box]
     let network: [Box: [Box]]
@@ -18,6 +87,10 @@ struct DetectionResult {
     /// paragraph-inference passes can use line groupings directly rather
     /// than reverse-engineering them from tagged boxes.
     let words: [RecognizedWord]
+    /// Per-edge attribution for debug visualisation. Empty in non-debug
+    /// runs (origins only get populated when `Config.debug` would consume
+    /// them — see `BoxFinder.detect`).
+    let edgeOrigins: [BoxPair: EdgeOrigin]
 }
 
 /// Faithful port of `boxfinder.py`'s `BoxFinder.predict` pipeline:
@@ -27,7 +100,11 @@ struct DetectionResult {
 ///
 /// All numeric thresholds and shape rules match the Python originals.
 struct BoxFinder {
-    var ksizeBase: (Int, Int)
+    /// Reference morphology-closing kernel size at `scale = 1.0`. Matches the
+    /// Python tuning. No longer user-tunable — OCR-driven word boxes
+    /// (`applyVisionBoxes`) now dominate selectable construction for text,
+    /// so the old "box size" knob added noise without meaningful control.
+    var ksizeBase: (Int, Int) = (8, 5)
     /// `(seaGroupingThreshold, calmnessThreshold)` in 8-bit LAB units.
     /// Sea grouping is intentionally tight — at threshold 5 a pure-white
     /// region (L≈255) and a near-white region (L≈251) merge into one sea,
@@ -39,13 +116,18 @@ struct BoxFinder {
     var seaPointGap: Int = 10
 
     private(set) var scale: Double = 1.0
+    /// User-controlled multiplier applied to every distance-based clustering
+    /// budget: `mergeDistance` in `buildNetwork`, the gap factors in
+    /// `connectAlignedSeries`, and the proximity budget in `connectCaptions`.
+    /// `1.0` reproduces the tuned baseline; lower tightens, higher relaxes.
+    private let clusterSensitivity: Double
+    /// Per-edge attribution. Populated as edges are added by each
+    /// constructor pass; consumed by `DebugImageWriter` to colour arrows
+    /// in `3_connections.png`.
+    private let edgeOrigins = EdgeOriginMap()
 
     init() {
-        // Pull the user-controlled box-size scale from settings each detection.
-        // The reference values (8, 5) match the Python tuning at scale = 1.0.
-        let s = Config.boxSize
-        ksizeBase = (max(1, Int((8.0 * s).rounded())),
-                     max(1, Int((5.0 * s).rounded())))
+        clusterSensitivity = max(0, Config.clusterSensitivity)
     }
 
     private var ksize: (w: Int, h: Int) {
@@ -62,6 +144,7 @@ struct BoxFinder {
         scale = Double(h) / 1964.0
         let kx = ksize.w
         let ky = ksize.h
+        edgeOrigins.reset()
 
         // Kick OCR off on a parallel worker while the LAB / Canny / morphology
         // / CC pipeline runs on this thread. Vision's `.fast` text recogniser
@@ -79,7 +162,8 @@ struct BoxFinder {
         guard let lab = LABConverter.convert(cgImage) else {
             ocrGroup.wait()
             return DetectionResult(boxes: [], network: [:], seas: [],
-                                   tags: [:], words: recognizedWords)
+                                   tags: [:], words: recognizedWords,
+                                   edgeOrigins: [:])
         }
 
         // 1. Edge detection on the L channel + morphological closing.
@@ -90,13 +174,12 @@ struct BoxFinder {
                                       kw: kx, kh: ky)
 
         // 2. Connected-components labelling stands in for `findContours(RETR_TREE)`.
-        //    The legacy `parentIndex` is intentionally unused now — the
-        //    nested-children rule that consumed it was a font-size-blind
-        //    proxy for "drop interior pieces of text", which the OCR-driven
-        //    sub-letter pass below handles directly.
-        let (allBoxes, _) = ConnectedComponents.label(closed,
-                                                       width: lab.width,
-                                                       height: lab.height)
+        //    Parent hierarchy used to be returned alongside but is no longer
+        //    consumed — the nested-children rule that needed it was replaced
+        //    by the OCR-driven sub-letter pass below.
+        let allBoxes = ConnectedComponents.label(closed,
+                                                 width: lab.width,
+                                                 height: lab.height)
 
         let initialCount = allBoxes.count
 
@@ -168,19 +251,48 @@ struct BoxFinder {
         //      context* there (a button's sea is the page background it
         //      sits on), which is exactly what the perimeter samples.
         let visionDerived: Set<Box> = Set(recognizedWords.map { $0.box })
+        // Per-box sampling is independent — fan out over cores. The cluster
+        // scan inside `interiorColourPair` is the heaviest per-box cost in
+        // the whole pipeline on text-rich screens, and `seaColourAndValidity`
+        // is non-trivial too. We pre-size scratch buffers indexed by the
+        // original `selectable` order, write each result in parallel, then
+        // collapse to the filtered output deterministically — sea grouping
+        // downstream depends on encounter order so we preserve it.
+        let n = selectable.count
+        let finder = self
+        var primaryBuf = [(Int, Int, Int)](repeating: (0, 0, 0), count: n)
+        var secondaryBuf = [(Int, Int, Int)](repeating: (0, 0, 0), count: n)
+        var keepBuf = [Bool](repeating: false, count: n)
+
+        primaryBuf.withUnsafeMutableBufferPointer { pPtr in
+            secondaryBuf.withUnsafeMutableBufferPointer { sPtr in
+                keepBuf.withUnsafeMutableBufferPointer { kPtr in
+                    DispatchQueue.concurrentPerform(iterations: n) { i in
+                        let box = selectable[i]
+                        if visionDerived.contains(box) {
+                            guard let pair = finder.interiorColourPair(lab: lab, box: box) else { return }
+                            pPtr[i] = pair.0
+                            sPtr[i] = pair.1
+                            kPtr[i] = true
+                        } else {
+                            guard let (colour, calm) = finder.seaColourAndValidity(lab: lab, box: box),
+                                  calm else { return }
+                            pPtr[i] = colour
+                            sPtr[i] = colour
+                            kPtr[i] = true
+                        }
+                    }
+                }
+            }
+        }
+
         var stableBoxes: [Box] = []
         var seaColours: [((Int, Int, Int), (Int, Int, Int))] = []
-        for box in selectable {
-            if visionDerived.contains(box) {
-                guard let pair = interiorColourPair(lab: lab, box: box) else { continue }
-                stableBoxes.append(box)
-                seaColours.append(pair)
-            } else {
-                guard let (colour, calm) = seaColourAndValidity(lab: lab, box: box),
-                      calm else { continue }
-                stableBoxes.append(box)
-                seaColours.append((colour, colour))   // degenerate single-colour pair
-            }
+        stableBoxes.reserveCapacity(n)
+        seaColours.reserveCapacity(n)
+        for i in 0..<n where keepBuf[i] {
+            stableBoxes.append(selectable[i])
+            seaColours.append((primaryBuf[i], secondaryBuf[i]))
         }
         selectable = stableBoxes
 
@@ -226,11 +338,9 @@ struct BoxFinder {
                   wordCount, recognizedWords.count)
             DebugImageWriter.writeIfEnabled(
                 source: cgImage,
-                edges: edges,
-                width: lab.width,
-                height: lab.height,
                 seas: seas,
                 network: network,
+                edgeOrigins: edgeOrigins.map,
                 words: recognizedWords,
                 lineToParagraph: lineToParagraph,
                 paragraphSize: paragraphSize
@@ -238,7 +348,8 @@ struct BoxFinder {
         }
 
         return DetectionResult(boxes: selectable, network: network, seas: seasOut,
-                               tags: tags, words: recognizedWords)
+                               tags: tags, words: recognizedWords,
+                               edgeOrigins: edgeOrigins.map)
     }
 
     // MARK: - Stage helpers
@@ -254,8 +365,15 @@ struct BoxFinder {
     /// instead looks at **consecutive-sample** distances along each edge in
     /// spatial order — gradients yield small step-to-step deltas, while
     /// genuinely noisy backgrounds (text, photo content, multi-element
-    /// regions) yield large jumps. The mean colour is still returned so sea
-    /// grouping behaviour downstream is unchanged.
+    /// regions) yield large jumps.
+    ///
+    /// The returned sea colour is the per-channel **median** of the
+    /// perimeter samples. Median (not mean) so that the occasional
+    /// glyph stroke or descender clipping the sample line doesn't
+    /// shift the colour — a minority of dark text pixels around a
+    /// light background would otherwise drag the mean toward grey and
+    /// land the word in a different sea than its neighbours on the
+    /// same page.
     private func seaColourAndValidity(lab: LABImage, box: Box) -> ((Int, Int, Int), Bool)? {
         let m = max(1, margin)
         let gap = seaPointGap
@@ -281,11 +399,23 @@ struct BoxFinder {
         let total = top.count + bottom.count + left.count + right.count
         if total == 0 { return ((0, 0, 0), false) }
 
-        var sumL = 0, sumA = 0, sumB = 0
+        // Per-channel median over all perimeter samples. Sorting each
+        // channel independently is fine here — channels are independent
+        // dimensions in LAB, and the goal is robustness to outliers per
+        // axis, not preservation of correlated triplets.
+        var lValues = [Int](); lValues.reserveCapacity(total)
+        var aValues = [Int](); aValues.reserveCapacity(total)
+        var bValues = [Int](); bValues.reserveCapacity(total)
         for edge in [top, bottom, left, right] {
-            for s in edge { sumL += s.0; sumA += s.1; sumB += s.2 }
+            for s in edge {
+                lValues.append(s.0)
+                aValues.append(s.1)
+                bValues.append(s.2)
+            }
         }
-        let meanColour = (sumL / total, sumA / total, sumB / total)
+        lValues.sort(); aValues.sort(); bValues.sort()
+        let mid = total / 2
+        let medianColour = (lValues[mid], aValues[mid], bValues[mid])
 
         // Smoothness budget reused from the noise threshold. We compare
         // squared LAB distances between consecutive samples on the same edge
@@ -307,11 +437,11 @@ struct BoxFinder {
         // Tiny boxes whose edges fit inside a single sample don't have any
         // transitions to inspect — fall back to "calm" rather than rejecting
         // them outright, since the size filter has already vetted them.
-        if transitions == 0 { return (meanColour, true) }
+        if transitions == 0 { return (medianColour, true) }
         // ≥70% of consecutive transitions must be smooth. Multiplied form
         // avoids floating point — "smooth / transitions ≥ 0.7" rewritten.
         let calm = smooth * 10 >= transitions * 7
-        return (meanColour, calm)
+        return (medianColour, calm)
     }
 
     /// Pair of dominant LAB colours inside a Vision word box, found by
@@ -498,7 +628,13 @@ struct BoxFinder {
     ///     base; an outlier edge here would otherwise drag in its
     ///     neighbour-set during those passes and survive intact.
     ///   * `connectAlignedSeries` for stacked rows / inline text segments.
+    ///   * `pruneLargeBoxConnections` — wipe every edge touching a "large"
+    ///     non-text box. Pairwise + aligned-series have already attached
+    ///     anything the geometry gates allowed; the wipe gives caption
+    ///     linking a clean slate to rebuild a strict caption-only
+    ///     neighbour set.
     ///   * `connectCaptions` — OCR-aware text-label-to-anchor linker.
+    ///     Adds back the only edges large boxes are allowed to have.
     ///   * `pruneCrossingConnections` — drop edges whose shortest connecting
     ///     segment cuts through an unrelated box.
     ///   * `pruneParagraphAnchors` (phase 5) — for words living in a
@@ -508,6 +644,9 @@ struct BoxFinder {
     ///   * `applyHeadingAsymmetry` (phase 3) — for heading-sized words,
     ///     suppress the `body → heading` direction so cluster-expansion
     ///     from a heading pulls in its body, but never the reverse.
+    ///   * `addBridgeConnections` — symmetrise the rare "two-incoming,
+    ///     no outgoing" body-text triple. Runs last so it sees the final
+    ///     post-prune state.
     ///
     /// Engulfment is never connected. The Python `_connect_noisy_boxes` step that
     /// linked nested children to their containing parent is intentionally absent
@@ -519,13 +658,23 @@ struct BoxFinder {
                               medianWordArea: Double) -> [Box: [Box]] {
         var network: [Box: [Box]] = [:]
 
-        // The merge distance is intentionally derived from the Python-reference
-        // ksize `(8, 5)` (scaled to image resolution) rather than the user-tuned
-        // morphology kernel. Smaller user box sizes still get a generous neighbour
-        // search radius — otherwise adjacent UI elements would never cluster.
+        // Two distances feed downstream passes:
+        //   * `baseMergeDistance` — pure geometric scale (Python-reference
+        //     ksize `(8, 5)` × image-resolution scale). Used everywhere a
+        //     *what counts as substantial* gate matters: `largeBoxThreshold`
+        //     for `connectAlignedSeries` and `connectCaptions`. Invariant to
+        //     the user's cluster-sensitivity slider, because moving the
+        //     slider shouldn't redefine "this chart is large".
+        //   * `mergeDistance` — `baseMergeDistance × clusterSensitivity`.
+        //     Used only as the neighbour-search radius in
+        //     `connectionProbability`. Sliding right widens the radius —
+        //     things further apart can still cluster — without inflating
+        //     the caption / aligned-series budgets, which stay anchored to
+        //     box dimensions.
         let refW = 8.0 * scale
         let refH = 5.0 * scale
-        let mergeDistance = (refW * refW + refH * refH).squareRoot() * 2
+        let baseMergeDistance = (refW * refW + refH * refH).squareRoot() * 2
+        let mergeDistance = baseMergeDistance * clusterSensitivity
 
         for sea in seas {
             for box in sea.members {
@@ -539,6 +688,7 @@ struct BoxFinder {
                     if boxArea * asymRatio < Double(other.area) { continue }
                     if box.connectionProbability(other, mergeDistance: mergeDistance) > 0.5 {
                         connections.append(other)
+                        edgeOrigins.recordIfAbsent(box, other, .pairwise)
                     }
                 }
                 network[box] = connections
@@ -546,24 +696,128 @@ struct BoxFinder {
         }
 
         pruneOutlierConnections(network: &network)
+        // `connectAlignedSeries` gets two distances: the unscaled
+        // `baseMergeDistance` for `largeBoxThreshold` (a size concept that
+        // shouldn't drift with the slider) and the scaled `mergeDistance`
+        // as the per-pair max-reach budget (the same `Dp` pairwise used
+        // — slider widens it consistently across passes).
         connectAlignedSeries(seas: seas, tags: tags,
-                             network: &network, mergeDistance: mergeDistance)
-        connectCaptions(boxes: boxes, tags: tags, seas: seas,
-                        lineToParagraph: lineToParagraph,
-                        paragraphSize: paragraphSize,
-                        network: &network, mergeDistance: mergeDistance)
-        pruneCrossingConnections(boxes: boxes, network: &network)
+                             network: &network,
+                             baseDistance: baseMergeDistance,
+                             pairwiseDistance: mergeDistance)
+        // Wipe every edge touching a large non-text box. `connectCaptions`
+        // runs next and re-adds only the proximity-gated caption edges,
+        // so large boxes end up with caption-style neighbours exclusively.
         pruneLargeBoxConnections(tags: tags,
-                                 lineToParagraph: lineToParagraph,
-                                 paragraphSize: paragraphSize,
                                  medianWordArea: medianWordArea,
                                  network: &network)
+        connectCaptions(boxes: boxes, tags: tags,
+                        network: &network, mergeDistance: baseMergeDistance)
+        pruneCrossingConnections(boxes: boxes, network: &network)
         pruneParagraphAnchors(tags: tags,
                               lineToParagraph: lineToParagraph,
                               paragraphSize: paragraphSize,
                               network: &network)
         applyHeadingAsymmetry(tags: tags, network: &network)
+        addBridgeConnections(tags: tags, network: &network,
+                             pairwiseDistance: mergeDistance)
+        // Drop origin entries for pairs that didn't survive pruning so
+        // the debug overlay only colours edges that are actually present.
+        edgeOrigins.gc(against: network)
         return network
+    }
+
+    /// Re-introduce bridge edges: if a body-text box `B` receives
+    /// directed edges from exactly two distinct body-text sources `A1`
+    /// and `A2`, both within `pairwiseDistance` of `B`, and `B` has no
+    /// outgoing edge to either, add `B → A1` and `B → A2`. Pair origins
+    /// for the augmented edges are force-overwritten to `.bridges`.
+    ///
+    /// Constraints:
+    ///   * All three boxes are `.word`-tagged. Bridging only re-symmetrises
+    ///     small-character sentence flow; non-text containers and headings
+    ///     are excluded.
+    ///   * All three heights are ≤ `1.5 × median word height` (same gate
+    ///     `applyHeadingAsymmetry` uses to call a word a heading) — body
+    ///     text only, so a heading isn't dragged in via its body
+    ///     neighbours.
+    ///   * Edge distances `B↔A1` and `B↔A2` are both ≤ `pairwiseDistance`
+    ///     — the same `Dp` the pairwise pass used. This stops a sentence
+    ///     word that has two improbably-far incoming neighbours from
+    ///     gluing them together; bridging must keep the cluster locally
+    ///     coherent.
+    ///
+    /// Runs last so it sees the final post-prune neighbour structure;
+    /// otherwise an edge slated for removal could turn into the second
+    /// "incoming" that triggers the rule.
+    private func addBridgeConnections(tags: [Box: BoxKind],
+                                      network: inout [Box: [Box]],
+                                      pairwiseDistance: Double) {
+        // Body-text height ceiling: 1.5 × median word height. Below that
+        // counts as body; above is heading.
+        var heights: [Int] = []
+        for (box, kind) in tags {
+            if case .word = kind { heights.append(box.height) }
+        }
+        let headingThreshold: Double
+        if heights.count >= 3 {
+            heights.sort()
+            headingThreshold = Double(heights[heights.count / 2]) * 1.5
+        } else {
+            // Not enough text to fix a baseline — skip bridging entirely
+            // rather than guess. Bridging is specifically for body-text
+            // sentences; if there isn't enough text, there isn't enough
+            // body to bridge.
+            return
+        }
+
+        @inline(__always) func isBodyWord(_ box: Box) -> Bool {
+            guard case .word = tags[box] else { return false }
+            return Double(box.height) <= headingThreshold
+        }
+
+        // Build the inverse adjacency map: for each target, the boxes
+        // with a directed edge into it.
+        var incoming: [Box: [Box]] = [:]
+        for (from, neighbours) in network {
+            for to in neighbours {
+                incoming[to, default: []].append(from)
+            }
+        }
+
+        var toAdd: [(Box, Box)] = []
+        for (target, sources) in incoming {
+            if !isBodyWord(target) { continue }
+
+            // Two distinct sources only. Early-break past 2 so a target
+            // with many incoming edges fails fast.
+            var unique: [Box] = []
+            for s in sources where !unique.contains(s) {
+                unique.append(s)
+                if unique.count > 2 { break }
+            }
+            guard unique.count == 2 else { continue }
+            let s1 = unique[0], s2 = unique[1]
+            if !isBodyWord(s1) || !isBodyWord(s2) { continue }
+
+            let outgoing = network[target] ?? []
+            if outgoing.contains(s1) || outgoing.contains(s2) { continue }
+
+            // Local-coherence: both senders must be within Dp of the
+            // target. Edge-to-edge distance, the same measure pairwise
+            // uses.
+            if target.edgeDistance(s1) > pairwiseDistance { continue }
+            if target.edgeDistance(s2) > pairwiseDistance { continue }
+
+            toAdd.append((target, s1))
+            toAdd.append((target, s2))
+        }
+
+        for (from, to) in toAdd {
+            if network[from]?.contains(to) ?? false { continue }
+            network[from, default: []].append(to)
+            edgeOrigins.setOrigin(from, to, .bridges)
+        }
     }
 
     /// After every connection pass has run, look at each box's neighbour set
@@ -659,24 +913,73 @@ struct BoxFinder {
             }
         }
 
-        var toPrune: [(Box, Box)] = []
+        // Spatial index: boxes sorted by `left`. For each edge we binary-search
+        // the upper bound of `left ≤ segMaxX`, then walk forward only those
+        // candidates and reject by y-range / x-overhang before falling through
+        // to the expensive Liang–Barsky clip. Without this index the inner
+        // loop is O(boxes) per edge; with it, typical edges visit a small
+        // fraction of `boxes`.
+        let sortedByLeft = boxes.sorted { $0.left < $1.left }
+        let lefts = sortedByLeft.map { $0.left }
+
+        // Flatten edges so the heavy blocker scan can fan out across cores.
+        // Each edge's prune decision is independent — we collect a Bool per
+        // edge in a pre-sized buffer, then apply removals serially at the end
+        // so the symmetric mutation of `network` stays race-free.
+        var edges: [(Box, Box)] = []
         for (a, neighbours) in network {
             for b in neighbours {
-                guard let segment = shortestSegment(a, b) else { continue }
-                for c in boxes where c != a && c != b {
-                    if neighbourSet[a]?.contains(c) == true { continue }
-                    if neighbourSet[b]?.contains(c) == true { continue }
-                    if pointInside(segment.0, box: c)
-                        && pointInside(segment.1, box: c) { continue }
-                    if segmentIntersectsBox(p1: segment.0, p2: segment.1, box: c) {
-                        toPrune.append((a, b))
+                edges.append((a, b))
+            }
+        }
+        if edges.isEmpty { return }
+
+        let finder = self
+        var pruneFlags = [Bool](repeating: false, count: edges.count)
+        pruneFlags.withUnsafeMutableBufferPointer { flags in
+            DispatchQueue.concurrentPerform(iterations: edges.count) { idx in
+                let (a, b) = edges[idx]
+                guard let segment = finder.shortestSegment(a, b) else { return }
+
+                let sx0 = segment.0.0, sx1 = segment.1.0
+                let sy0 = segment.0.1, sy1 = segment.1.1
+                let segMinX = Int((sx0 < sx1 ? sx0 : sx1).rounded(.down))
+                let segMaxX = Int((sx0 < sx1 ? sx1 : sx0).rounded(.up))
+                let segMinY = Int((sy0 < sy1 ? sy0 : sy1).rounded(.down))
+                let segMaxY = Int((sy0 < sy1 ? sy1 : sy0).rounded(.up))
+
+                // Upper bound: first index where `left > segMaxX`. Candidates
+                // live in `[0, upperIdx)` — any blocker further right cannot
+                // intersect the segment's bbox.
+                var lo = 0, hi = lefts.count
+                while lo < hi {
+                    let mid = (lo + hi) >> 1
+                    if lefts[mid] <= segMaxX { lo = mid + 1 } else { hi = mid }
+                }
+                let upperIdx = lo
+
+                let aNeighbours = neighbourSet[a]
+                let bNeighbours = neighbourSet[b]
+
+                for i in 0..<upperIdx {
+                    let c = sortedByLeft[i]
+                    if c == a || c == b { continue }
+                    if c.right < segMinX { continue }
+                    if c.top > segMaxY || c.bottom < segMinY { continue }
+                    if aNeighbours?.contains(c) == true { continue }
+                    if bNeighbours?.contains(c) == true { continue }
+                    if finder.pointInside(segment.0, box: c)
+                        && finder.pointInside(segment.1, box: c) { continue }
+                    if finder.segmentIntersectsBox(p1: segment.0, p2: segment.1, box: c) {
+                        flags[idx] = true
                         break
                     }
                 }
             }
         }
 
-        for (a, b) in toPrune {
+        for idx in 0..<edges.count where pruneFlags[idx] {
+            let (a, b) = edges[idx]
             network[a]?.removeAll { $0 == b }
             network[b]?.removeAll { $0 == a }
         }
@@ -747,23 +1050,31 @@ struct BoxFinder {
         return tmin < tmax
     }
 
-    /// Link a `.word` to a substantial `.nonText` anchor whenever the
-    /// word sits very close to one of the anchor's edges — a chart title
-    /// above a plot, an axis label below a row of ticks, a legend right
-    /// next to a panel.
+    /// Link a small box to a substantial "anchor" box whenever the
+    /// small box sits very close to one of the anchor's edges — a chart
+    /// title above a plot, an axis label below a row of ticks, a
+    /// legend right next to a panel, a close-button glyph adjacent to a
+    /// dialog header. The small/anchor partition is by *size* alone:
+    /// neither side has to be text.
     ///
     /// Gates (in order):
     ///   * Anchor must be substantial (`min(w, h) ≥ largeBoxThreshold`).
-    ///   * `word.height ≤ 0.4 × anchor.height`.
-    ///   * Same sea (cross-sea is too eager when applied broadly).
+    ///   * Small box's `min(w, h) < largeBoxThreshold` (so two large
+    ///     boxes never form a caption edge between them — they were
+    ///     just wiped by `pruneLargeBoxConnections` and shouldn't come
+    ///     back through this pass).
+    ///   * `small.height ≤ 0.4 × anchor.height` — keeps the
+    ///     caption/label shape proportion; rejects two adjacent
+    ///     similarly-tall boxes that would otherwise satisfy the
+    ///     proximity test.
     ///   * **Direction-aware edge proximity**. Edge-to-edge gaps (not
     ///     centre-to-centre); same proximity budget on each axis:
     ///     `budget = min(anchor.width, anchor.height) / 8`.
-    ///       * x-overlap > 0, y-overlap = 0 (word above or below):
+    ///       * x-overlap > 0, y-overlap = 0 (small above or below):
     ///         require `y-gap ≤ budget`.
-    ///       * y-overlap > 0, x-overlap = 0 (word to the side of):
+    ///       * y-overlap > 0, x-overlap = 0 (small to the side of):
     ///         require `x-gap ≤ budget`.
-    ///       * Both overlap (word inside anchor): reject — that's a
+    ///       * Both overlap (small inside anchor): reject — that's a
     ///         label on top of the box, not a caption around its edge.
     ///       * Neither overlap (corner-position): reject — captions sit
     ///         on an edge.
@@ -773,14 +1084,15 @@ struct BoxFinder {
     /// far away along their shorter axis — `height/8` is the relevant
     /// scale there, not `width/8`.
     ///
-    /// Multi-word lines propagate: once any word on a Vision line links
-    /// to an anchor, every word with the same `lineID` links too. Keeps
-    /// "Time (s)" intact when only the first word passed proximity.
+    /// Multi-word text lines still propagate (only for `.word`-tagged
+    /// small boxes that share a Vision `lineID`) — once any word on a
+    /// line links to an anchor, every word with the same `lineID`
+    /// links too. Keeps "Time (s)" intact when only the first word
+    /// passed proximity. Non-text small boxes don't have lineIDs and
+    /// so don't trigger propagation, which is fine — they're one-off
+    /// glyphs, not multi-element labels.
     private func connectCaptions(boxes: [Box],
                                  tags: [Box: BoxKind],
-                                 seas: [Sea],
-                                 lineToParagraph: [Int: Int],
-                                 paragraphSize: [Int: Int],
                                  network: inout [Box: [Box]],
                                  mergeDistance: Double) {
         let largeThreshold = largeBoxThreshold(mergeDistance)
@@ -790,80 +1102,69 @@ struct BoxFinder {
         // banner uses 15 (= 120/8), not 125, as the cap.
         let proximityDivisor: Double = 8.0
 
-        var words: [Box] = []
-        var anchors: [Box] = []
+        // Partition by size, not by OCR tag. Any substantial box can be
+        // an anchor; any non-substantial box can be a caption.
+        var largeBoxes: [Box] = []
+        var smallBoxes: [Box] = []
         for box in boxes {
-            switch tags[box] {
-            case .word:         words.append(box)
-            case .nonText, nil: anchors.append(box)
+            if Double(min(box.width, box.height)) >= largeThreshold {
+                largeBoxes.append(box)
+            } else {
+                smallBoxes.append(box)
             }
         }
 
-        var seaOf: [Box: Int] = [:]
-        seaOf.reserveCapacity(boxes.count)
-        for (idx, sea) in seas.enumerated() {
-            for box in sea.members { seaOf[box] = idx }
-        }
+        var captionEdges: [(small: Box, anchor: Box)] = []
+        for small in smallBoxes {
+            for anchor in largeBoxes {
+                if Double(small.height) > Double(anchor.height) * 0.4 { continue }
 
-        var captionEdges: [(word: Box, anchor: Box)] = []
-        for word in words {
-            for anchor in anchors {
-                if Double(min(anchor.width, anchor.height)) < largeThreshold { continue }
-                if Double(word.height) > Double(anchor.height) * 0.4 { continue }
-
-                // Same-sea only — captions across colour boundaries are
-                // too risky without per-element grouping evidence.
-                if let wordSea = seaOf[word], let anchorSea = seaOf[anchor],
-                   wordSea != anchorSea { continue }
-
-                let xOverlap = min(word.right, anchor.right) - max(word.left, anchor.left)
-                let yOverlap = min(word.bottom, anchor.bottom) - max(word.top, anchor.top)
+                let xOverlap = min(small.right, anchor.right) - max(small.left, anchor.left)
+                let yOverlap = min(small.bottom, anchor.bottom) - max(small.top, anchor.top)
 
                 if xOverlap > 0 && yOverlap > 0 {
-                    // Word is inside the anchor — label, not caption.
+                    // Small box is inside the anchor — label, not caption.
                     continue
                 }
 
                 let budget = Double(min(anchor.width, anchor.height)) / proximityDivisor
 
                 if xOverlap > 0 {
-                    // Word above or below — check the edge-to-edge y-gap.
-                    let yGap = word.bottom <= anchor.top
-                        ? anchor.top - word.bottom
-                        : word.top - anchor.bottom
+                    // Small box above or below — check the edge-to-edge y-gap.
+                    let yGap = small.bottom <= anchor.top
+                        ? anchor.top - small.bottom
+                        : small.top - anchor.bottom
                     if Double(yGap) > budget { continue }
                 } else if yOverlap > 0 {
-                    // Word to the side — check the edge-to-edge x-gap.
-                    let xGap = word.right <= anchor.left
-                        ? anchor.left - word.right
-                        : word.left - anchor.right
+                    // Small box to the side — check the edge-to-edge x-gap.
+                    let xGap = small.right <= anchor.left
+                        ? anchor.left - small.right
+                        : small.left - anchor.right
                     if Double(xGap) > budget { continue }
                 } else {
                     // No overlap on either axis — corner position. Reject.
                     continue
                 }
 
-                captionEdges.append((word, anchor))
+                captionEdges.append((small, anchor))
             }
         }
 
-        for (w, a) in captionEdges {
-            linkBoxes(w, a, network: &network)
+        for (s, a) in captionEdges {
+            linkBoxes(s, a, network: &network, origin: .captions)
         }
 
-        // Line propagation — once any word on a Vision line links to an
-        // anchor, every word with the same `lineID` links too. Multi-
-        // word captions like "Time (s)" stay intact even when only one
-        // of the words passed the proximity gate.
+        // Line propagation for text small-box captions only — non-text
+        // boxes have no `lineID` and so propagate nowhere.
         var wordsByLine: [Int: [Box]] = [:]
-        for word in words {
-            if case let .word(_, _, lineID) = tags[word] {
-                wordsByLine[lineID, default: []].append(word)
+        for small in smallBoxes {
+            if case let .word(_, _, lineID) = tags[small] {
+                wordsByLine[lineID, default: []].append(small)
             }
         }
         var anchorsByLine: [Int: Set<Box>] = [:]
-        for (w, a) in captionEdges {
-            if case let .word(_, _, lineID) = tags[w] {
+        for (s, a) in captionEdges {
+            if case let .word(_, _, lineID) = tags[s] {
                 anchorsByLine[lineID, default: []].insert(a)
             }
         }
@@ -871,7 +1172,7 @@ struct BoxFinder {
             guard let lineWords = wordsByLine[lineID] else { continue }
             for anchor in anchorSet {
                 for w in lineWords {
-                    linkBoxes(w, anchor, network: &network)
+                    linkBoxes(w, anchor, network: &network, origin: .captions)
                 }
             }
         }
@@ -906,17 +1207,25 @@ struct BoxFinder {
     /// `small → large` edge prevents hovering a small thing from pulling its
     /// anchor into the selection while still letting the anchor reach down
     /// into its own labels/captions.
-    private func linkBoxes(_ a: Box, _ b: Box, network: inout [Box: [Box]]) {
+    private func linkBoxes(_ a: Box, _ b: Box, network: inout [Box: [Box]],
+                           origin: EdgeOrigin) {
         let aArea = Double(a.area)
         let bArea = Double(b.area)
         let aMuchSmaller = aArea * asymRatio < bArea
         let bMuchSmaller = bArea * asymRatio < aArea
+        var added = false
         if !aMuchSmaller, !(network[a]?.contains(b) ?? false) {
             network[a, default: []].append(b)
+            added = true
         }
         if !bMuchSmaller, !(network[b]?.contains(a) ?? false) {
             network[b, default: []].append(a)
+            added = true
         }
+        // Record origin whenever at least one direction was added by this
+        // call. `recordIfAbsent` keeps the earliest pass's attribution if
+        // a later pass tries to re-link an already-present pair.
+        if added { edgeOrigins.recordIfAbsent(a, b, origin) }
     }
 
     /// Final pass: connect boxes that read as part of a series — text on the
@@ -940,16 +1249,27 @@ struct BoxFinder {
     ///     "heading expands to body" behaviour.
     /// Non-text or mixed pairs keep the original stricter gates so an
     /// icon-vs-label or chart-vs-tick pair doesn't get glued.
+    ///
+    /// **Hard distance cap.** Independent of the row/column geometry
+    /// gates, the edge-to-edge distance between the two boxes must not
+    /// exceed `max(Dp, min(a.w, a.h, b.w, b.h) / 8)`, where `Dp` is the
+    /// same merge distance the pairwise pass used. The cap stops a large
+    /// box from chaining to a tiny far-away element through the aligned-
+    /// series gate alone — the `avgH × gapFactor` budget grows with the
+    /// average box height and is overly permissive when one side is
+    /// hundreds of pixels tall. Using the *smaller* box's min dim / 8 as
+    /// the upper bound keeps the cap tight for mixed-size pairs.
     private func connectAlignedSeries(seas: [Sea],
                                       tags: [Box: BoxKind],
                                       network: inout [Box: [Box]],
-                                      mergeDistance: Double) {
+                                      baseDistance: Double,
+                                      pairwiseDistance: Double) {
         let heightRatioMin: Double = 0.7
         let projectionMin:  Double = 0.5
         let gapFactor:      Double = 1.5
         let textProjectionMin: Double = 0.3
         let textGapFactor:     Double = 2.5
-        let largeThreshold = largeBoxThreshold(mergeDistance)
+        let largeThreshold = largeBoxThreshold(baseDistance)
 
         for sea in seas where sea.members.count > 1 {
             let members = sea.members
@@ -1015,7 +1335,18 @@ struct BoxFinder {
                     }
 
                     guard connect else { continue }
-                    linkBoxes(a, b, network: &network)
+
+                    // Hard distance cap. The smaller box's `min(w,h)/8` is
+                    // the upper bound; the pairwise merge distance is the
+                    // lower bound. Edge-to-edge distance must not exceed
+                    // the cap regardless of how friendly the geometry
+                    // gates were.
+                    let smallestMinDim = Double(min(min(a.width, a.height),
+                                                    min(b.width, b.height)))
+                    let maxReach = max(pairwiseDistance, smallestMinDim / 8.0)
+                    if a.edgeDistance(b) > maxReach { continue }
+
+                    linkBoxes(a, b, network: &network, origin: .alignedSeries)
                 }
             }
         }
@@ -1213,25 +1544,20 @@ struct BoxFinder {
 
     // MARK: - Large-box edge restriction
 
-    /// Restrict the neighbour set of "large" non-text boxes (figures,
-    /// panels, charts — anything that can hold ≥ 20 typical words) to
-    /// caption-tier text only. Two large boxes never link to each other;
-    /// a large box never links to a sentence or paragraph word.
+    /// Wipe **every** edge that touches a "large" non-text box, in both
+    /// directions. The pairwise and aligned-series passes are too
+    /// permissive about what attaches to a chart / panel / figure;
+    /// rather than trying to selectively prune, we clear the slate and
+    /// let `connectCaptions` (which runs immediately after) re-add only
+    /// the proximity-gated caption edges. The end state: large boxes
+    /// have caption-style neighbours and nothing else.
     ///
     /// Definition of "large": `area > 20 × medianWordArea`. Median (not
-    /// mean) so that a banner-text outlier in the Vision output doesn't
+    /// mean) so a banner-text outlier in the Vision output doesn't
     /// shift the threshold.
-    ///
-    /// Runs as a post-process pass after `connectCaptions` so caption
-    /// edges added there (which already passed the 1/8 proximity gate)
-    /// survive, while the per-sea pairwise's "everything in the same sea
-    /// can connect" promiscuity is reined in.
     private func pruneLargeBoxConnections(tags: [Box: BoxKind],
-                                          lineToParagraph: [Int: Int],
-                                          paragraphSize: [Int: Int],
                                           medianWordArea: Double,
                                           network: inout [Box: [Box]]) {
-        let captionMaxWords = 5
         let largeAreaThreshold = medianWordArea * 20.0
 
         var largeBoxes: Set<Box> = []
@@ -1243,27 +1569,16 @@ struct BoxFinder {
         }
         if largeBoxes.isEmpty { return }
 
-        var toPrune: [(Box, Box)] = []
-        for largeBox in largeBoxes {
-            guard let neighbours = network[largeBox] else { continue }
-            for n in neighbours {
-                if largeBoxes.contains(n) {
-                    toPrune.append((largeBox, n))
-                    continue
-                }
-                if case let .word(_, _, lineID) = tags[n] {
-                    let size = lineToParagraph[lineID]
-                        .flatMap { paragraphSize[$0] } ?? 1
-                    if size > captionMaxWords {
-                        toPrune.append((largeBox, n))
-                    }
-                }
-            }
+        // Drop every outgoing edge from a large box.
+        for large in largeBoxes {
+            network[large] = []
         }
-
-        for (a, b) in toPrune {
-            network[a]?.removeAll { $0 == b }
-            network[b]?.removeAll { $0 == a }
+        // Drop every incoming edge into a large box from elsewhere.
+        for (box, neighbours) in network where !largeBoxes.contains(box) {
+            let filtered = neighbours.filter { !largeBoxes.contains($0) }
+            if filtered.count != neighbours.count {
+                network[box] = filtered
+            }
         }
     }
 
@@ -1280,10 +1595,16 @@ struct BoxFinder {
     ///        larger than `20 × median(word area)`.
     ///      * **Caption** (≤ 10 words): not subject to this rule.
     ///
-    /// 2. **Cross-paragraph word ↔ word prune.** Any `.word` ↔ `.word`
-    ///    edge spanning different Vision paragraphs is cut. The
-    ///    aligned-series gate is geometry-only; paragraph identity is
-    ///    the logical-grouping boundary those edges shouldn't cross.
+    /// 2. **Cross-paragraph word ↔ word prune.** Cut any `.word` ↔ `.word`
+    ///    edge that crosses Vision-line groups *unless both endpoints
+    ///    are caption-sized* (≤ `captionMaxWords`). Two body paragraphs
+    ///    must never glue together, even when Vision fragments them into
+    ///    sub-paragraph chunks; symmetrically, a caption next to a
+    ///    paragraph isn't the same thing as that paragraph and shouldn't
+    ///    chain into it. Only caption-↔-caption survives, which covers
+    ///    "Figure 1" near "Figure 2", label/value pairs, and rows of
+    ///    short axis labels — short groups whose members really do
+    ///    belong in a single cluster.
     private func pruneParagraphAnchors(tags: [Box: BoxKind],
                                        lineToParagraph: [Int: Int],
                                        paragraphSize: [Int: Int],
@@ -1327,14 +1648,22 @@ struct BoxFinder {
             }
         }
 
-        // (2) Cross-paragraph word ↔ word.
+        // (2) Cross-group word ↔ word — cut unless both endpoints live
+        // in caption-sized groups. Sentences and paragraphs (in any
+        // mixture) must not chain across Vision-line boundaries; only
+        // genuinely short label-style groups stay linked, since those
+        // sometimes belong together (multi-row tick labels, side-by-side
+        // figure captions). The check uses `paragraphSize` directly so a
+        // paragraph that Vision happened to fragment into short
+        // sub-groups still gets cut from anything beyond a caption.
         for (word, paraA) in paragraphOfBox {
             guard let neighbours = network[word] else { continue }
+            let sizeA = paragraphSize[paraA] ?? 1
             for n in neighbours {
-                guard let paraB = paragraphOfBox[n] else { continue }
-                if paraA != paraB {
-                    toPrune.append((word, n))
-                }
+                guard let paraB = paragraphOfBox[n], paraA != paraB else { continue }
+                let sizeB = paragraphSize[paraB] ?? 1
+                if sizeA <= captionMaxWords && sizeB <= captionMaxWords { continue }
+                toPrune.append((word, n))
             }
         }
 

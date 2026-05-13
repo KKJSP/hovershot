@@ -5,9 +5,9 @@ private let aboutText: String =
     + "select them by hovering. The shortcuts below apply while the capture overlay "
     + "is active."
 
-private let boxSizeHint =
-    "Lower values produce smaller individual boxes; higher values merge adjacent "
-    + "elements."
+private let clusterSensitivityHint =
+    "Lower values keep clusters tight — only very close elements connect. Higher "
+    + "values let elements glue across wider gaps."
 
 /// Display order for the shortcut list — separate from the enum's case order so
 /// it can group "global" before "overlay".
@@ -198,13 +198,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
 
         addFullWidth(separator())
 
-        // Box size.
+        // Cluster sensitivity.
         let sizeHeader = NSStackView()
         sizeHeader.orientation = .horizontal
         sizeHeader.alignment = .centerY
         sizeHeader.spacing = 8
-        let sizeTitle = makeLabel("Box size", bold: true)
-        sizeValueLabel = NSTextField(labelWithString: percentString(Config.boxSize))
+        let sizeTitle = makeLabel("Cluster sensitivity", bold: true)
+        sizeValueLabel = NSTextField(labelWithString: percentString(Config.clusterSensitivity))
         sizeValueLabel.alignment = .right
         sizeValueLabel.font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize,
                                                                 weight: .regular)
@@ -214,18 +214,18 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         sizeHeader.addArrangedSubview(sizeValueLabel)
         addFullWidth(sizeHeader)
 
-        // Slider range is internally 0…2 so the old "100% = 1.0" setting now
-        // sits at the slider's halfway mark and there's twice as much headroom
-        // above it. The percent display below renormalises the value back to
-        // 0…100% for the label so the UI still reads as a single percentage.
-        sizeSlider = NSSlider(value: Config.boxSize, minValue: 0.0, maxValue: 2.0,
-                              target: self, action: #selector(boxSizeChanged(_:)))
-        sizeSlider.numberOfTickMarks = 11
+        // Slider range 0…4 with the tuned baseline (1.0) sitting at 25% so
+        // there's substantial headroom above the default for relaxing
+        // clusters. The percent display rescales by × 25 so the full slider
+        // range still reads as a familiar 0%…100%.
+        sizeSlider = NSSlider(value: Config.clusterSensitivity, minValue: 0.0, maxValue: 4.0,
+                              target: self, action: #selector(clusterSensitivityChanged(_:)))
+        sizeSlider.numberOfTickMarks = 9
         sizeSlider.allowsTickMarkValuesOnly = false
         sizeSlider.isContinuous = true
         addFullWidth(sizeSlider)
 
-        let sizeHint = makeLabel(boxSizeHint, bold: false)
+        let sizeHint = makeLabel(clusterSensitivityHint, bold: false)
         sizeHint.maximumNumberOfLines = 0
         sizeHint.lineBreakMode = .byWordWrapping
         sizeHint.preferredMaxLayoutWidth = 540 - 2 * hPad
@@ -390,17 +390,17 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         Config.debug = (sender.state == .on)
     }
 
-    @objc private func boxSizeChanged(_ sender: NSSlider) {
+    @objc private func clusterSensitivityChanged(_ sender: NSSlider) {
         let v = sender.doubleValue
-        Config.boxSize = v
+        Config.clusterSensitivity = v
         sizeValueLabel.stringValue = percentString(v)
     }
 
     private func percentString(_ value: Double) -> String {
-        // Slider value lives in 0…2 (see `sizeSlider` setup) so the displayed
-        // percent is half the raw value — keeps the label as a familiar
-        // 0–100% number while the underlying multiplier keeps its full range.
-        String(format: "%.0f%%", value * 50)
+        // Slider value lives in 0…4 with `1.0` as the tuned baseline. The
+        // displayed percent rescales by × 25 so the default reads as 25%
+        // and the slider's right edge reads as 100%.
+        String(format: "%.0f%%", value * 25)
     }
 
     @objc private func openCredits() {

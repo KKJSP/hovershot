@@ -9,14 +9,16 @@ enum Config {
     private static let prefix = "hovershot"
     private static let keyDebug = "\(prefix).debug"
     private static let keySaveFolder = "\(prefix).saveFolder"
-    private static let keyBoxSize = "\(prefix).boxSize"
+    private static let keyClusterSensitivity = "\(prefix).clusterSensitivity"
     private static let keyPadding = "\(prefix).padding"
 
-    /// Multiplier applied to the Python-tuned `(8, 5)` ksize. Slider runs 0…2
-    /// and displays as "0%…100%" via `value × 50`, so this `1.0` default sits
-    /// at the 50% mark — equivalent to the old 100% setting that users now
-    /// need as the practical floor after the NMS-aware edge detector landed.
-    static let defaultBoxSize: Double = 1.0
+    /// Multiplier applied to all distance-based clustering budgets in the
+    /// network construction passes — `mergeDistance`, `connectAlignedSeries`
+    /// gap factors, and the `connectCaptions` proximity budget. `1.0` is the
+    /// neutral baseline (matches the values the pipeline was tuned at); lower
+    /// values tighten clustering, higher values let elements glue across
+    /// wider gaps.
+    static let defaultClusterSensitivity: Double = 1.0
 
     /// Default padding (in view-space pixels) applied around the selection rect
     /// when saving or copying a screenshot.
@@ -41,17 +43,19 @@ enum Config {
         }
     }
 
-    /// Multiplier applied to the BoxFinder's morphological-closing kernel.
-    /// Smaller produces smaller individual boxes; larger merges adjacent ones.
-    /// Reads with a presence check so the typed `double(forKey:)` zero-default
-    /// does not shadow a legitimately stored value.
-    static var boxSize: Double {
+    /// Multiplier applied to distance-based clustering budgets. Lower values
+    /// tighten clustering (less merging), higher values relax it (wider gaps
+    /// connect). Reads with a presence check so the typed `double(forKey:)`
+    /// zero-default does not shadow a legitimately stored value.
+    static var clusterSensitivity: Double {
         get {
             let defaults = UserDefaults.standard
-            guard defaults.object(forKey: keyBoxSize) != nil else { return defaultBoxSize }
-            return defaults.double(forKey: keyBoxSize)
+            guard defaults.object(forKey: keyClusterSensitivity) != nil else {
+                return defaultClusterSensitivity
+            }
+            return defaults.double(forKey: keyClusterSensitivity)
         }
-        set { UserDefaults.standard.set(newValue, forKey: keyBoxSize) }
+        set { UserDefaults.standard.set(newValue, forKey: keyClusterSensitivity) }
     }
 
     /// Pixels of padding added around the selection when cropping the saved /
